@@ -1,0 +1,90 @@
+{
+  "//": "Copy vào .claude/agent-loop.json của repo bạn. Đây là CHÍNH SÁCH của repo — plugin chỉ mang cơ chế. Mọi khoá đều tuỳ chọn; thiếu thì dùng mặc định in ra bởi `tal config`.",
+
+  "baseBranch": "dev",
+  "mainBranch": "main",
+  "ttlSeconds": 2700,
+  "maxAttempts": 3,
+
+  "//batch": "ĐƠN VỊ CÔNG VIỆC LÀ MỘT LÔ. Một lô = min..max issue → một worktree → một PR → MỘT lần review → MỘT lần CI. Chi phí cố định của một vòng gần như không phụ thuộc số issue trong đó; trả nó cho từng issue một là nhân lên 10–20 lần. Đừng để min < 5 — lô nhỏ là quay lại đúng cái đang phải chữa.",
+  "batch": { "min": 10, "max": 20 },
+
+  "//affectedTests": "Test Impact Analysis: đường dẫn nào đổi thì chạy lệnh test nào. `tal tests` suy ra lệnh từ bảng này; `tal tests --run` chạy chúng. ĐÂY LÀ THỨ DUY NHẤT VÒNG LẶP ĐƯỢC CHẠY. Lệnh phải HẸP (theo filter / theo thư mục / theo package), không bao giờ là toàn bộ suite.",
+  "affectedTests": [
+    {
+      "when": "^lang/|^resources/js/.*\\.(json|ts)$",
+      "run": ["pnpm test -- --run i18n"],
+      "why": "chuỗi hiển thị: chỉ cần test i18n, không cần gì khác"
+    },
+    {
+      "when": "^backend/app/([A-Za-z]+)/",
+      "run": ["cd backend && vendor/bin/pest --compact --filter=Unit"],
+      "why": "code PHP: chạy nhóm test của tầng bị chạm"
+    },
+    {
+      "when": "\\.tsx?$",
+      "run": ["pnpm typecheck"],
+      "why": "đổi TS thì typecheck là rào rẻ nhất"
+    },
+    {
+      "when": "^backend/database/migrations/",
+      "run": ["cd backend && vendor/bin/pest --compact --group=migration"],
+      "why": "DDL: test trên engine thật, không chỉ SQLite"
+    }
+  ],
+
+  "//fullSuite": "KHÔNG PHẢI MỘT BƯỚC CỦA VÒNG LẶP. `hook-guard` CHẶN đúng những chuỗi lệnh này nếu chúng chạy trong worktree của vòng lặp. Chúng chạy ở CI của PR vào mainBranch (`tal release-to-main`), hoặc khi NGƯỜI gõ `tal fullsuite` từ gốc repo.",
+  "fullSuite": [
+    "cd backend && php -d memory_limit=-1 vendor/bin/pest --compact",
+    "pnpm typecheck"
+  ],
+
+  "//submodulePrBase": "gitmodules (mặc định, an toàn) | default. gitmodules = base PR của submodule lấy từ trường branch trong .gitmodules, tức đúng nhánh umbrella theo dõi. Đổi sang 'default' chỉ khi default branch của repo con KHÔNG gắn auto-deploy. Lưu ý: issue chạm submodule KHÔNG đi đường lô — nó đi `tal claim <N>` một mình.",
+  "submodulePrBase": "gitmodules",
+
+  "//labels": "Bốn nhãn đầu là quy ước SẴN CÓ của repo — khai đúng tên repo đang dùng để bảng issue không bị chẻ làm hai hệ. Để rỗng nếu repo không dùng nhãn đó. Năm nhãn agent:* do plugin sở hữu, `tal doctor --fix` tự tạo.",
+  "labels": {
+    "working": "status:executing",
+    "reviewing": "status:reviewing",
+    "blocked": "status:blocked",
+    "shipped": "status:shipped",
+    "ready": "agent:ready",
+    "awaitingReview": "agent:awaiting-review",
+    "changesRequested": "agent:changes-requested",
+    "reviewPassed": "agent:review-passed",
+    "deadLetter": "agent:dead-letter"
+  },
+
+  "//severityOrder": "Xếp hạng hàng đợi sau nhãn changesRequested. Tên nhãn severity của repo, nặng trước nhẹ sau.",
+  "severityOrder": ["critical", "security", "high", "bug"],
+
+  "//policyDocs": "Skill BẮT BUỘC đọc các file này trước khi làm. Đây là chỗ đặt quy ước riêng của repo: cách chạy test theo vùng, checklist review, cạm bẫy đã biết.",
+  "policyDocs": {
+    "work": ".claude/agent-loop/work-policy.md",
+    "review": ".claude/agent-loop/review-checklist.md",
+    "test": ".claude/agent-loop/test-policy.md"
+  },
+
+  "//docsGenericRules": "Kiểm chung ngoài bản đồ docsRules. MẶC ĐỊNH RỖNG có chủ ý: một luật gắn cứng đường dẫn của repo khác là phát biểu SAI ở repo bạn, và một phát biểu sai còn tệ hơn im lặng. Khai khi bạn thật sự có quy ước đó.",
+  "docsGenericRules": [
+    {
+      "when": "^backend/routes/|Controllers/",
+      "expectPrefix": "backend/storage/api-docs/",
+      "why": "chạm route/controller nhưng không regen tài liệu API"
+    }
+  ],
+
+  "//docsRules": "Bản đồ code→doc cho `tal docs-check <PR>`. Lấy từ chính những dòng 'Tracked in <doc>' mà tài liệu repo tự tuyên bố, đừng tự nghĩ ra.",
+  "docsRules": [
+    {
+      "when": "BusinessClock|business_day|Timezone/",
+      "expect": ["docs/guide/business-time.md"],
+      "why": "thời gian nghiệp vụ phải theo timezone của chi nhánh, không theo đồng hồ app"
+    },
+    {
+      "when": "\\.env|config/.*\\.php|docker-compose|BYPASS|_DEV_",
+      "expect": ["docs/guide/local-config.md"],
+      "why": "ranh giới local vs production: cờ bypass, guard theo môi trường, file pin host/credential"
+    }
+  ]
+}

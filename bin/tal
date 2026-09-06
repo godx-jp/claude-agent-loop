@@ -1,0 +1,2770 @@
+#!/usr/bin/env python3
+"""tal — điều phối nhiều session Claude Code trên cùng một backlog GitHub issue.
+
+Bài toán: N session chạy song song trên cùng một repo, không được phép hai session
+cùng làm một issue. Label một mình KHÔNG giải quyết được — label không có
+compare-and-swap (hai session đọc "chưa ai nhận" cùng lúc là cả hai tưởng mình
+thắng), và label bị rò khi session chết, để lại `status:executing` vĩnh viễn.
+
+Thiết kế theo chuẩn:
+
+  * Mutual exclusion   — lease (Gray & Cheriton) trên một primitive CAS thật:
+                         POST /git/refs trả 422 "Reference already exists" nếu ref
+                         đã tồn tại. Đó là compare-and-swap phía server GitHub.
+  * Liveness           — visibility timeout kiểu SQS: TTL + heartbeat. Mốc thời
+                         gian dùng `updated_at` của ledger comment (đồng hồ
+                         SERVER), không dùng đồng hồ máy giữ lease → miễn nhiễm
+                         clock skew.
+  * Fencing            — Kleppmann: TTL không chặn được tiến trình bị treo lâu rồi
+                         tỉnh lại và ghi tiếp. Mọi hành động ghi (push / PR /
+                         label) phải qua `tal assert` kiểm epoch đơn điệu tăng;
+                         push luôn `--force-with-lease`.
+  * Poison message     — dead-letter sau MAX_ATTEMPTS vòng, chuyển cho người.
+  * Separation of duty — session review phải khác session code (so session id).
+
+Đơn vị công việc là một LÔ, không phải một issue:
+
+  batch claim (10–20 issue) → sửa hết trong MỘT worktree → `tal tests --run`
+  → MỘT PR → MỘT lần review → MỘT lần CI → merge.
+
+  Chi phí cố định của một vòng gần như không phụ thuộc số issue trong đó. Trả
+  chi phí ấy cho từng issue một là nhân nó lên 10–20 lần mà không mua thêm gì.
+  Rào cho "một issue hỏng giữ con tin cả lô" là `batch drop`: mỗi commit mang
+  `(#N)` nên gỡ đúng phần của một issue ra là thao tác cơ học.
+
+  FULL SUITE KHÔNG THUỘC VỀ VÒNG LẶP. Vòng lặp chạy `tal tests` (test liên quan,
+  theo affectedTests). Full suite chạy ở CI của PR vào mainBranch, hoặc khi người
+  gõ `tal fullsuite`. hook-guard chặn nó trong worktree.
+
+Lệnh chính:
+  doctor / config / queue / status / gc / unlock
+  batch claim|status|drop · tests · pr · release
+  review-queue / review-claim / review-verdict · merge-queue / merge
+  claim (một issue — đường của ca chạm submodule) / renew / assert
+  submodule / submodule-check / submodule-pr
+  fullsuite / release-to-main / hook-guard
+
+Chính sách của từng repo (base branch, tên nhãn, lệnh test, checklist review) nằm
+trong .claude/agent-loop.json + các file policyDocs, KHÔNG nằm trong file này.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cấu hình
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Mặc định. Project ghi đè qua .claude/agent-loop.json, env ghi đè lên nữa. ────
+# Ranh giới cố ý: tal giữ CƠ CHẾ (lease, fencing, hàng đợi, GC). CHÍNH SÁCH của từng
+# repo — base branch, tên nhãn theo quy ước sẵn có, lệnh test, checklist review —
+# nằm trong config + các file policy mà skill đọc. Nhét chính sách vào đây là biến
+# tal thành tool của một repo duy nhất.
+CONFIG_FILE = ".claude/agent-loop.json"
+DEFAULTS = {
+    "baseBranch": "dev",
+    "ttlSeconds": 45 * 60,
+    "graceSeconds": 90,
+    "maxAttempts": 3,
+    "refNamespace": "refs/agent-loop/leases/",
+    "submodulePrBase": "gitmodules",     # "gitmodules" | "default"
+    "labels": {
+        "ready": "agent:ready",
+        "working": "status:executing",
+        "reviewing": "status:reviewing",
+        "blocked": "status:blocked",
+        "shipped": "status:shipped",
+        "awaitingReview": "agent:awaiting-review",
+        "changesRequested": "agent:changes-requested",
+        "reviewPassed": "agent:review-passed",
+        "deadLetter": "agent:dead-letter",
+    },
+    "severityOrder": ["critical", "security", "high", "bug"],
+    "policyDocs": {},                    # {"work": "...", "review": "...", "test": "..."}
+    "mainBranch": "main",
+    # ĐƠN VỊ CÔNG VIỆC LÀ MỘT LÔ, KHÔNG PHẢI MỘT ISSUE.
+    # Một lô = 10–20 issue → một worktree → một PR → MỘT lần review → MỘT lần CI.
+    # Lý do: chi phí cố định của một vòng (claim, review, CI, merge, gc) gần như không
+    # phụ thuộc số issue trong đó. Trả chi phí ấy cho từng issue một là nhân nó lên 20.
+    "batch": {"min": 10, "max": 20},
+    # Test Impact Analysis: đường dẫn đổi → lệnh test phải chạy. Đây là thứ DUY NHẤT
+    # vòng lặp được phép chạy (`tal tests`).
+    "affectedTests": [],                 # [{"when": "<regex đường dẫn>", "run": ["…"]}]
+    # Full suite KHÔNG thuộc về vòng lặp. Nó chạy ở CI của PR vào mainBranch, hoặc khi
+    # NGƯỜI gõ `tal fullsuite`. hook-guard chặn nó chạy trong worktree.
+    "fullSuite": [],
+}
+CFG: dict = json.loads(json.dumps(DEFAULTS))   # bản sao, load_config() sẽ trộn vào
+
+TTL = DEFAULTS["ttlSeconds"]
+GRACE = DEFAULTS["graceSeconds"]
+MAX_ATTEMPTS = DEFAULTS["maxAttempts"]
+REF_NS = DEFAULTS["refNamespace"]
+BASE_BRANCH = DEFAULTS["baseBranch"]
+MAIN_BRANCH = DEFAULTS["mainBranch"]
+BATCH_MIN = DEFAULTS["batch"]["min"]
+BATCH_MAX = DEFAULTS["batch"]["max"]
+LEDGER_MARKER = "<!-- tal:ledger v1 -->"
+REVIEW_MARKER = "tal:review"
+LEASE_FILE = ".tal-lease.json"
+
+L_READY = L_WORKING = L_REVIEWING = L_AWAIT = L_CHANGES = L_PASSED = L_DEAD = ""
+L_BLOCKED = L_SHIPPED = ""
+MANAGED: set = set()
+SEVERITY_RANK: dict = {}
+
+
+def load_config():
+    """Trộn: DEFAULTS → .claude/agent-loop.json → biến môi trường."""
+    global CFG, TTL, GRACE, MAX_ATTEMPTS, REF_NS, BASE_BRANCH, MANAGED, SEVERITY_RANK
+    global MAIN_BRANCH, BATCH_MIN, BATCH_MAX
+    global L_READY, L_WORKING, L_REVIEWING, L_AWAIT, L_CHANGES, L_PASSED, L_DEAD
+    global L_BLOCKED, L_SHIPPED
+
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or run(
+        ["git", "rev-parse", "--show-toplevel"], check=False).stdout.strip() or "."
+    f = Path(root) / CONFIG_FILE
+    if f.is_file():
+        try:
+            user = json.loads(f.read_text())
+        except json.JSONDecodeError as e:
+            raise Fail(f"{f} không phải JSON hợp lệ: {e}", 2)
+        for k, v in user.items():
+            if isinstance(v, dict) and isinstance(CFG.get(k), dict):
+                CFG[k].update(v)
+            else:
+                CFG[k] = v
+    CFG["_configPath"] = str(f) if f.is_file() else None
+
+    TTL = int(os.environ.get("TAL_TTL", CFG["ttlSeconds"]))
+    GRACE = int(os.environ.get("TAL_GRACE", CFG["graceSeconds"]))
+    MAX_ATTEMPTS = int(os.environ.get("TAL_MAX_ATTEMPTS", CFG["maxAttempts"]))
+    REF_NS = os.environ.get("TAL_REF_NS", CFG["refNamespace"])
+    BASE_BRANCH = os.environ.get("TAL_BASE", CFG["baseBranch"])
+    MAIN_BRANCH = os.environ.get("TAL_MAIN", CFG.get("mainBranch") or "main")
+    _b = CFG.get("batch") or {}
+    BATCH_MIN = int(os.environ.get("TAL_BATCH_MIN", _b.get("min", 10)))
+    BATCH_MAX = int(os.environ.get("TAL_BATCH_MAX", _b.get("max", 20)))
+
+    lb = CFG["labels"]
+    L_READY, L_WORKING = lb["ready"], lb["working"]
+    L_REVIEWING, L_BLOCKED, L_SHIPPED = lb["reviewing"], lb["blocked"], lb["shipped"]
+    L_AWAIT, L_CHANGES = lb["awaitingReview"], lb["changesRequested"]
+    L_PASSED, L_DEAD = lb["reviewPassed"], lb["deadLetter"]
+    # Nhãn do vòng lặp sở hữu: mọi lần ghi label là ghi trọn bộ này, giữ nguyên phần
+    # còn lại. Nhãn để rỗng trong config = repo đó không dùng, và cũng không bị quản.
+    MANAGED = {x for x in (L_WORKING, L_REVIEWING, L_AWAIT, L_CHANGES, L_PASSED,
+                           L_DEAD, L_BLOCKED, L_SHIPPED) if x}
+    SEVERITY_RANK = {name: i for i, name in enumerate(CFG["severityOrder"])}
+
+def agent_labels() -> dict:
+    """Nhãn `tal doctor --fix` tự tạo. Nhãn theo quy ước sẵn có của repo (working /
+    reviewing / blocked / shipped) KHÔNG nằm đây — repo đã có chúng, và màu/mô tả là
+    việc của repo, không phải của plugin."""
+    return {
+        L_READY: ("1f883d", "Vòng lặp agent được phép tự nhặt issue này"),
+        L_AWAIT: ("a371f7", "PR đã mở, chờ session review"),
+        L_CHANGES: ("d93f0b", "Review yêu cầu sửa — ưu tiên cao nhất trong hàng đợi"),
+        L_PASSED: ("0e8a16", "Review đạt — đủ điều kiện merge khi CI của PR xanh"),
+        L_DEAD: ("b60205", "Quá số vòng cho phép — cần người can thiệp"),
+    }
+
+CONVENTIONAL = re.compile(
+    r"^(feat|fix|chore|docs|refactor|test|build|ci|perf|style|revert)(\([^)]+\))?!?: .+"
+)
+
+# LUẬT TÊN — đúng hai dạng, không có dạng thứ ba:
+#
+#   issue-<số>              một issue đứng riêng — ĐƯỜNG BẮT BUỘC khi chạm submodule
+#   batch-<YYYYMMDD-HHMM>   một LÔ 10–20 issue: một PR, một review, một CI
+#
+# Vì sao lô vẫn truy vết được. Pointer submodule là sha trơ, không mang thông tin, nên
+# nhánh nào chạm submodule vẫn phải mang số issue trong tên. Nhưng LÔ bị CẤM chạm
+# submodule (cổng trong `tal pr`), nên chuỗi truy vết của nó đi đường khác và chặt hơn
+# tên branch: mỗi commit trong lô BẮT BUỘC mang `(#N)`, và `tal pr` từ chối mở PR nếu
+# còn commit không map được về đúng một issue của lô. Nhờ đó `tal batch drop <N>` gỡ
+# được đúng phần việc của một issue ra khỏi lô mà không đụng 19 issue còn lại.
+BRANCH_RE = re.compile(r"^issue-\d+$")
+BATCH_RE = re.compile(r"^batch-\d{8}-\d{4}$")
+
+
+def is_batch(name: str | None) -> bool:
+    return bool(BATCH_RE.match(name or ""))
+
+
+def assert_branch_name(name: str, where: str = ""):
+    if BRANCH_RE.match(name) or BATCH_RE.match(name):
+        return
+    raise Fail(
+        f"tên branch không hợp lệ: {name!r}{(' (' + where + ')') if where else ''}\n"
+        "Chỉ được đặt `issue-<số>` hoặc `batch-<YYYYMMDD-HHMM>`; `tal batch claim` tự đặt "
+        "đúng tên. Trong submodule thì CHỈ `issue-<số>` — lô không được chạm submodule.", 2
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Nền: chạy lệnh, thời gian, in ấn
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class Fail(Exception):
+    """Lỗi có thông điệp cho người đọc; exit code mang ý nghĩa."""
+
+    def __init__(self, msg: str, code: int = 1):
+        super().__init__(msg)
+        self.code = code
+
+
+BUSY = 75  # EX_TEMPFAIL — "người khác đang giữ", không phải lỗi
+
+
+def run(cmd: list[str], cwd: str | None = None, check: bool = True, stdin: str | None = None):
+    # GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE ĐÈ cả `-C` và cwd. Nếu tal được gọi từ trong
+    # một git hook, các biến này bị kế thừa và mọi lệnh git ở đây sẽ chạy sai repo —
+    # đúng cái bẫy đã làm .githooks/pre-commit báo pointer đã push là dangling.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+    p = subprocess.run(
+        cmd, cwd=cwd, input=stdin, capture_output=True, text=True, env=env
+    )
+    if check and p.returncode != 0:
+        raise Fail(f"lệnh thất bại: {' '.join(cmd)}\n{p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def gh(args: list[str], check: bool = True, stdin: str | None = None):
+    return run(["gh"] + args, check=check, stdin=stdin)
+
+
+def gh_json(args: list[str], default=None):
+    """Không bao giờ raise — 404/422 trả `default`. Người gọi tự quyết coi None là lỗi hay không."""
+    p = gh(args, check=False)
+    if p.returncode != 0:
+        return default
+    out = p.stdout.strip()
+    if not out:
+        return default
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return default
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def human_delta(sec: float) -> str:
+    sec = int(sec)
+    sign = "-" if sec < 0 else ""
+    sec = abs(sec)
+    if sec < 60:
+        return f"{sign}{sec}s"
+    if sec < 3600:
+        return f"{sign}{sec // 60}m"
+    return f"{sign}{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+def emit(obj, as_json: bool):
+    if as_json:
+        print(json.dumps(obj, ensure_ascii=False, indent=2))
+    return obj
+
+
+def warn(msg: str):
+    print(f"[tal] {msg}", file=sys.stderr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ngữ cảnh repo
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class Ctx:
+    _login = None
+    _repo = None
+    _main = None
+
+    @property
+    def repo(self) -> str:
+        if Ctx._repo is None:
+            url = run(["git", "config", "--get", "remote.origin.url"]).stdout.strip()
+            m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", url)
+            if not m:
+                raise Fail(f"không suy ra được owner/repo từ remote: {url}")
+            Ctx._repo = m.group(1)
+        return Ctx._repo
+
+    @property
+    def login(self) -> str:
+        if Ctx._login is None:
+            Ctx._login = gh(["api", "user", "-q", ".login"]).stdout.strip()
+        return Ctx._login
+
+    @property
+    def main_worktree(self) -> Path:
+        """Worktree gốc — nơi chứa .claude/worktrees/ và nơi chạy mọi lệnh git chung."""
+        if Ctx._main is None:
+            out = run(["git", "worktree", "list", "--porcelain"]).stdout
+            first = out.splitlines()[0]
+            Ctx._main = Path(first.split(" ", 1)[1].strip())
+        return Ctx._main
+
+    @property
+    def worktrees_dir(self) -> Path:
+        return self.main_worktree / ".claude" / "worktrees"
+
+    @property
+    def state_dir(self) -> Path:
+        d = Path.home() / ".tal" / self.repo.replace("/", "__") / "locks"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+
+C = Ctx()
+
+
+def session_id() -> str:
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("TAL_SESSION")
+    if sid:
+        return sid
+    return f"shell-{socket.gethostname()}-{os.getppid()}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ledger — sổ trạng thái, sống trong MỘT comment trên issue
+#
+# `updated_at` của comment là đồng hồ SERVER, nên nó là căn cứ duy nhất để nói
+# lease còn sống hay đã chết. Máy giữ lease không tự khai được là mình còn sống.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FENCE = re.compile(r"```json\s*\n(.*?)\n```", re.S)
+
+
+def _sanitize(s: str) -> str:
+    return s.replace("-->", "--&gt;").replace("```", "'''")
+
+
+def ledger_new(issue: int) -> dict:
+    return {
+        "version": 1,
+        "issue": issue,
+        "group": [issue],
+        "branch": f"issue-{issue}",
+        "state": "queued",
+        "batch": None,
+        "epoch": 0,
+        "attempts": 0,
+        "review_rounds": 0,
+        "reaps": 0,
+        "pr": None,
+        "sub_prs": {},
+        "lease": None,
+        "heartbeat": None,
+        "history": [],
+    }
+
+
+def ledger_read(issue: int) -> tuple[dict, int | None, datetime | None]:
+    """→ (data, comment_id, comment_updated_at). Không có sổ thì trả sổ trắng."""
+    comments = gh_json(
+        ["api", f"repos/{C.repo}/issues/{issue}/comments", "--paginate"], default=[]
+    )
+    for c in comments:
+        if LEDGER_MARKER in (c.get("body") or ""):
+            m = FENCE.search(c["body"])
+            if not m:
+                continue
+            try:
+                data = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                continue
+            return data, c["id"], parse_iso(c["updated_at"])
+    return ledger_new(issue), None, None
+
+
+def ledger_render(d: dict) -> str:
+    lease = d.get("lease")
+    if lease:
+        holder = f"`{lease['session'][:8]}…` trên `{lease.get('host','?')}`"
+        state_line = f"**{d['state']}** — đang giữ bởi {holder}, hết hạn {lease['expires_at']}"
+    else:
+        state_line = f"**{d['state']}** — không session nào đang giữ"
+    rows = [
+        f"| state | {d['state']} |",
+        f"| group | {', '.join('#' + str(n) for n in d['group'])} |",
+        f"| branch | `{d['branch']}` |",
+        f"| lô | {d.get('batch') or '—'} |",
+        f"| PR | {('#' + str(d['pr'])) if d.get('pr') else '—'} |",
+        f"| epoch (fencing token) | {d['epoch']} |",
+        f"| attempts / review rounds / reaps | {d['attempts']} / {d['review_rounds']} / {d['reaps']} |",
+    ]
+    hist = "\n".join(f"- {_sanitize(h)}" for h in d["history"][-15:]) or "- (chưa có)"
+    return (
+        f"{LEDGER_MARKER}\n"
+        "## TAL ledger — điều phối tự động\n\n"
+        f"{state_line}\n\n"
+        "| field | value |\n|---|---|\n" + "\n".join(rows) + "\n\n"
+        "<details><summary>lịch sử</summary>\n\n" + hist + "\n\n</details>\n\n"
+        "<details><summary>state (máy đọc — đừng sửa tay)</summary>\n\n"
+        "```json\n" + json.dumps(d, ensure_ascii=False, indent=2) + "\n```\n\n</details>\n"
+    )
+
+
+def ledger_write(d: dict, comment_id: int | None, note: str | None = None) -> int:
+    if note:
+        d.setdefault("history", []).append(f"{iso(now())} · {_sanitize(note)}")
+        d["history"] = d["history"][-40:]
+    d["heartbeat"] = iso(now())  # luôn đổi → server chắc chắn cập nhật updated_at
+    body = ledger_render(d)
+    if comment_id:
+        gh(
+            ["api", f"repos/{C.repo}/issues/comments/{comment_id}", "-X", "PATCH",
+             "-f", f"body={body}"]
+        )
+        return comment_id
+    res = gh_json(
+        ["api", f"repos/{C.repo}/issues/{d['issue']}/comments", "-f", f"body={body}"]
+    )
+    return res["id"]
+
+
+def lease_expired(d: dict, updated_at: datetime | None) -> bool:
+    """Hết hạn theo ĐỒNG HỒ SERVER. Không có ledger comment = coi như hết hạn."""
+    if updated_at is None:
+        return True
+    ttl = (d.get("lease") or {}).get("ttl", TTL)
+    return now() > updated_at + timedelta(seconds=ttl + GRACE)
+
+
+_ANCHOR_CLOCK: dict = {}
+
+
+def anchor_updated_at(anchor: int) -> datetime | None:
+    """updated_at của sổ issue NEO, nhớ lại trong một lần chạy tal."""
+    if anchor not in _ANCHOR_CLOCK:
+        _, _, upd = ledger_read(anchor)
+        _ANCHOR_CLOCK[anchor] = upd
+    return _ANCHOR_CLOCK[anchor]
+
+
+def lease_clock(issue: int) -> tuple[dict, int | None, datetime | None]:
+    """Sổ của issue + ĐỒNG HỒ quyết định lease còn sống hay chết.
+
+    Issue nằm trong một LÔ thì đồng hồ là sổ của issue NEO. `tal renew` vì thế chỉ chạm
+    MỘT sổ chứ không chạm 20 — 20 lần ghi API cho mỗi nhịp heartbeat là không chạy nổi."""
+    led, cid, upd = ledger_read(issue)
+    anchor = (led.get("lease") or {}).get("anchor")
+    if anchor and anchor != issue:
+        return led, cid, anchor_updated_at(anchor)
+    return led, cid, upd
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lease — CAS trên git ref + khoá cục bộ
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def ref_path(key: str) -> str:
+    return f"{REF_NS}{key}"
+
+
+def ref_create(key: str, sha: str) -> bool:
+    """True = mình vừa tạo được (giành được). False = đã có người giữ (422)."""
+    p = gh(
+        ["api", f"repos/{C.repo}/git/refs", "-f", f"ref={ref_path(key)}", "-f", f"sha={sha}"],
+        check=False,
+    )
+    if p.returncode == 0:
+        return True
+    blob = (p.stderr + p.stdout).lower()
+    if "already exists" in blob:
+        return False
+    raise Fail(f"không tạo được lease ref {key}: {p.stderr.strip()}")
+
+
+def ref_exists(key: str) -> bool:
+    p = gh(["api", f"repos/{C.repo}/git/ref/{ref_path(key)[5:]}"], check=False)
+    return p.returncode == 0
+
+
+def ref_delete(key: str):
+    gh(["api", "-X", "DELETE", f"repos/{C.repo}/git/refs/{ref_path(key)[5:]}"], check=False)
+
+
+def refs_all() -> list[str]:
+    out = gh_json(
+        ["api", f"repos/{C.repo}/git/matching-refs/{REF_NS[5:]}", "--paginate"], default=[]
+    )
+    return [r["ref"][len(REF_NS):] for r in out]
+
+
+def local_lock(key: str) -> bool:
+    """Khoá cục bộ: rào nhanh cho nhiều session trên CÙNG máy. Ref mới là căn cứ."""
+    d = C.state_dir / f"{key}.lock"
+    try:
+        d.mkdir()
+    except FileExistsError:
+        meta_f = d / "meta.json"
+        try:
+            meta = json.loads(meta_f.read_text())
+        except Exception:
+            meta = {}
+        if meta.get("session") == session_id():
+            return True                     # re-entrant, cùng session
+        if not ref_exists(key):
+            shutil.rmtree(d, ignore_errors=True)  # rác của session đã chết
+            return local_lock(key)
+        return False
+    (d / "meta.json").write_text(
+        json.dumps({"session": session_id(), "pid": os.getpid(), "at": iso(now())})
+    )
+    return True
+
+
+def local_unlock(key: str):
+    shutil.rmtree(C.state_dir / f"{key}.lock", ignore_errors=True)
+
+
+def head_sha() -> str:
+    run(["git", "fetch", "-q", "origin", BASE_BRANCH], cwd=str(C.main_worktree), check=False)
+    return run(
+        ["git", "rev-parse", f"origin/{BASE_BRANCH}"], cwd=str(C.main_worktree)
+    ).stdout.strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Label — ghi trọn bộ (PUT) để không bao giờ có trạng thái nửa vời
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def set_state_labels(issue: int, desired: set[str], drop: set[str] | None = None):
+    cur = gh_json(
+        ["api", f"repos/{C.repo}/issues/{issue}", "-q", "[.labels[].name]"], default=[]
+    )
+    drop = drop or set()
+    keep = [x for x in cur if x not in MANAGED and x not in drop]
+    final = sorted(set(keep) | desired)
+    if sorted(cur) == final:
+        return
+    payload = json.dumps({"labels": final})
+    gh(
+        ["api", f"repos/{C.repo}/issues/{issue}/labels", "-X", "PUT", "--input", "-"],
+        stdin=payload,
+    )
+    _ISSUE_CACHE.pop(issue, None)      # nhãn vừa đổi → lần đọc sau phải đọc thật
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Nhóm issue: parent + sub-issue (API sub_issues, `Parent: #N`, task-list)
+# ─────────────────────────────────────────────────────────────────────────────
+
+PARENT_RE = re.compile(r"^\s*(?:parent|thuộc|part of)\s*[::]\s*#(\d+)", re.I | re.M)
+TASK_RE = re.compile(r"^\s*[-*]\s*\[[ xX]\]\s*#(\d+)", re.M)
+
+
+_ISSUE_CACHE: dict = {}
+_PARENT_CACHE: dict = {}
+_KIDS_CACHE: dict = {}
+
+
+def issue_data(n: int) -> dict:
+    if n in _ISSUE_CACHE:
+        return _ISSUE_CACHE[n]
+    d = gh_json(
+        ["api", f"repos/{C.repo}/issues/{n}",
+         "-q", "{number,title,body,state,labels:[.labels[].name],pull_request:(.pull_request!=null)}"],
+        default=None,
+    )
+    if d is None:
+        raise Fail(f"không đọc được issue #{n}")
+    _ISSUE_CACHE[n] = d
+    return d
+
+
+def parent_of(n: int, body: str | None = None) -> int | None:
+    if n in _PARENT_CACHE:
+        return _PARENT_CACHE[n]
+    _PARENT_CACHE[n] = _parent_of(n, body)
+    return _PARENT_CACHE[n]
+
+
+def _parent_of(n: int, body: str | None = None) -> int | None:
+    api = gh_json(["api", f"repos/{C.repo}/issues/{n}/parent"], default=None)
+    if isinstance(api, dict) and api.get("number"):
+        return api["number"]
+    if body is None:
+        body = issue_data(n).get("body") or ""
+    m = PARENT_RE.search(body or "")
+    return int(m.group(1)) if m else None
+
+
+def children_of(n: int, body: str | None = None) -> list[int]:
+    if n in _KIDS_CACHE:
+        return _KIDS_CACHE[n]
+    _KIDS_CACHE[n] = _children_of(n, body)
+    return _KIDS_CACHE[n]
+
+
+def _children_of(n: int, body: str | None = None) -> list[int]:
+    kids: list[int] = []
+    api = gh_json(["api", f"repos/{C.repo}/issues/{n}/sub_issues", "--paginate"], default=[])
+    if isinstance(api, list):
+        kids += [c["number"] for c in api if c.get("number")]
+    if body is None:
+        body = issue_data(n).get("body") or ""
+    kids += [int(x) for x in TASK_RE.findall(body or "")]
+    seen, out = set(), []
+    for k in kids:
+        if k != n and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def group_claimable(n: int) -> bool:
+    """Parent có tự nhận cả nhóm được không.
+
+    Parent mở cổng `ready` = "làm cả cụm trong một branch". Parent KHÔNG mở cổng thì nó là
+    một tracker: việc thật nằm ở các sub-issue, mỗi cái tự nhận với branch issue-<số của
+    nó>. Không phân biệt hai vai này thì chia tầng thành vô nghĩa — mọi sub-issue bị gom
+    lại về đúng một branch của parent."""
+    names = set(issue_data(n)["labels"])
+    return L_READY in names and not ({L_BLOCKED, L_DEAD} & names)
+
+
+def resolve_group(n: int) -> tuple[int, list[int]]:
+    """→ (issue chính, cả nhóm).
+
+    Chỉ leo lên parent khi parent thật sự nhận-cả-nhóm được (xem group_claimable).
+    Parent là tracker → sub-issue đứng một mình, branch riêng theo số của chính nó."""
+    d = issue_data(n)
+    p = parent_of(n, d.get("body"))
+    root = n
+    hops = 0
+    while p and hops < 5 and group_claimable(p):
+        root = p
+        p = parent_of(root)
+        hops += 1
+    if root == n and not group_claimable(n):
+        return n, [n]          # tự nó chưa mở cổng: --force sẽ nhận lẻ, không gom con
+    kids = [k for k in children_of(root)
+            if issue_data(k)["state"] == "open" and not group_claimable(k)]
+    return root, [root] + kids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hàng đợi
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def open_issues() -> list[dict]:
+    return gh_json(
+        ["issue", "list", "--repo", C.repo, "--state", "open", "--limit", "300",
+         "--json", "number,title,labels,body,updatedAt"],
+        default=[],
+    )
+
+
+def rank(it: dict) -> tuple:
+    names = {l["name"] for l in it["labels"]}
+    fix_first = 0 if L_CHANGES in names else 1
+    sev = min([SEVERITY_RANK.get(x, 9) for x in names] + [9])
+    return (fix_first, sev, it["number"])
+
+
+def queue_eligible() -> tuple[list[dict], list[dict]]:
+    """→ (đủ điều kiện đã xếp hạng, bị bỏ qua kèm lý do). `queue` và `batch claim`
+    dùng CHUNG hàm này — hai chỗ lọc khác nhau là hai máy trạng thái khác nhau."""
+    live = set(refs_all())
+    items = open_issues()
+    by_num = {i["number"]: i for i in items}
+    eligible, skipped = [], []
+
+    for it in items:
+        n = it["number"]
+        names = {l["name"] for l in it["labels"]}
+        why = None
+        if L_READY not in names:
+            why = f"thiếu {L_READY} (chưa được người mở cổng)"
+        elif L_DEAD in names:
+            why = "dead-letter, chờ người"
+        elif L_BLOCKED in names:
+            why = "blocked"
+        elif L_REVIEWING in names or L_AWAIT in names:
+            why = "đang chờ review"
+        elif L_PASSED in names:
+            why = "review đạt, đang chờ merge"
+        elif f"issue-{n}" in live:
+            why = "đang có session giữ lease"
+        else:
+            p = parent_of(n, it.get("body"))
+            if p and p in by_num and group_claimable(p):
+                why = f"là sub-issue của #{p}, và #{p} nhận cả nhóm — nhận cùng parent"
+            elif any(f"issue-{x}" in live for x in [n] + children_of(n, it.get("body"))):
+                why = "một thành viên trong nhóm đang bị giữ"
+        (skipped if why else eligible).append(
+            {"number": n, "title": it["title"], "labels": sorted(names),
+             **({"skip": why} if why else {"rank": rank(it)})}
+        )
+
+    eligible.sort(key=lambda x: x["rank"])
+    for e in eligible:
+        e.pop("rank", None)
+    return eligible, skipped
+
+
+def cmd_queue(a):
+    eligible, skipped = queue_eligible()
+    out = {"role": "work", "repo": C.repo, "eligible": eligible,
+           "skipped": skipped if a.verbose else len(skipped)}
+    if a.json:
+        return emit(out, True)
+    if not eligible:
+        print("hàng đợi rỗng — không có issue nào đủ điều kiện")
+    for e in eligible[: a.limit]:
+        flag = "  ⟵ SỬA THEO REVIEW" if L_CHANGES in e["labels"] else ""
+        print(f"#{e['number']:<6} {e['title'][:78]}{flag}")
+    if a.verbose:
+        print("\n-- bỏ qua --")
+        for s in skipped:
+            print(f"#{s['number']:<6} {s['skip']}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# claim / renew / assert / release
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def cmd_claim(a):
+    if a.split:
+        # Nhánh riêng cho một sub-issue: hợp lệ, vì tên vẫn là `issue-<số issue thật>`.
+        root, group = a.issue, [a.issue]
+        if not parent_of(a.issue):
+            warn(f"#{a.issue} không phải sub-issue của issue nào — --split ở đây chỉ là nhận lẻ")
+    else:
+        root, group = resolve_group(a.issue)
+        if root != a.issue and not a.force_root:
+            warn(f"#{a.issue} là sub-issue của #{root} — nhận cả nhóm theo parent #{root}. "
+                 f"Muốn branch riêng cho #{a.issue} thì dùng --split.")
+
+    d0 = issue_data(root)
+    names = {x for x in d0["labels"]}
+    if L_READY not in names and not a.force:
+        raise Fail(f"#{root} chưa có nhãn {L_READY} — vòng lặp không tự nhặt. Dùng --force nếu người yêu cầu.")
+    if L_DEAD in names and not a.force:
+        raise Fail(f"#{root} đang ở dead-letter, cần người xử lý trước", 2)
+
+    keys = [f"issue-{n}" for n in group]
+    sha = head_sha()
+    got: list[str] = []
+    try:
+        for k in keys:
+            if not local_lock(k):
+                raise Fail(f"{k}: session khác trên máy này đang giữ", BUSY)
+            if not ref_create(k, sha):
+                local_unlock(k)
+                raise Fail(f"{k}: session khác đang giữ lease (ref đã tồn tại)", BUSY)
+            got.append(k)
+    except Fail:
+        for k in got:                    # nhận nhóm là all-or-nothing
+            ref_delete(k)
+            local_unlock(k)
+        raise
+
+    led, cid, _ = ledger_read(root)
+    led["group"] = group
+    led["branch"] = f"issue-{root}"
+    led["epoch"] = led.get("epoch", 0) + 1        # fencing token, đơn điệu tăng
+    led["attempts"] = led.get("attempts", 0) + 1
+    led["state"] = "executing"
+    led["lease"] = {
+        "key": f"issue-{root}",
+        "keys": keys,
+        "epoch": led["epoch"],
+        "session": session_id(),
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "ttl": TTL,
+        "acquired_at": iso(now()),
+        "expires_at": iso(now() + timedelta(seconds=TTL)),
+    }
+
+    if led["attempts"] > MAX_ATTEMPTS:
+        led["state"] = "dead_letter"
+        led["lease"] = None
+        ledger_write(led, cid, f"dead-letter: đã {led['attempts']-1} lần thử, quá MAX_ATTEMPTS={MAX_ATTEMPTS}")
+        for k in keys:
+            ref_delete(k)
+            local_unlock(k)
+        for n in group:
+            set_state_labels(n, {L_DEAD, L_BLOCKED})
+        raise Fail(f"#{root} vượt {MAX_ATTEMPTS} lần thử → dead-letter, cần người", 2)
+
+    wt = ensure_worktree(led["branch"])
+    led["lease"]["worktree"] = str(wt)
+    cid = ledger_write(led, cid, f"claim epoch={led['epoch']} session={session_id()[:8]} wt={wt.name}")
+
+    for n in group:
+        set_state_labels(n, {L_WORKING})
+
+    (wt / LEASE_FILE).write_text(json.dumps({
+        "repo": C.repo, "issue": root, "group": group, "branch": led["branch"],
+        "epoch": led["epoch"], "session": session_id(), "keys": keys,
+        "comment_id": cid, "acquired_at": led["lease"]["acquired_at"],
+    }, indent=2))
+
+    out = {"issue": root, "group": group, "branch": led["branch"], "worktree": str(wt),
+           "epoch": led["epoch"], "attempts": led["attempts"], "ttl": TTL,
+           "base": BASE_BRANCH, "session": session_id()}
+    if a.json:
+        return emit(out, True)
+    print(f"đã giành #{root} (nhóm {group}) epoch={led['epoch']} attempt={led['attempts']}")
+    print(f"worktree: {wt}\nbranch:   {led['branch']} (từ origin/{BASE_BRANCH})")
+    return out
+
+
+def mark_lease_released(issue: int, branch: str | None = None) -> None:
+    """Nhả lease thì ĐÁNH DẤU thẻ, đừng xoá nó.
+
+    Worktree được giữ lại có chủ ý cho vòng sửa sau. Nếu xoá thẻ thì hook mất căn cứ và
+    worktree đó thành vùng KHÔNG ai bảo vệ — đã xảy ra thật: một session khác ghi WIP vào
+    `.claude/worktrees/issue-1306` sau khi lease của nó đã nhả. Giữ thẻ + cờ `released`
+    thì hook vẫn biết worktree thuộc issue nào và chặn cho tới khi có người nhận lại,
+    còn `lease_file()` thì bỏ qua thẻ đã released nên không còn nhập nhằng."""
+    f = C.worktrees_dir / (branch or f"issue-{issue}") / LEASE_FILE
+    if not f.is_file():
+        return
+    try:
+        d = json.loads(f.read_text())
+    except Exception:
+        d = {"issue": issue}
+    d["released"] = True
+    d["released_at"] = iso(now())
+    d.pop("epoch", None)          # epoch cũ không còn giá trị fencing
+    f.write_text(json.dumps(d, indent=2))
+
+
+def lease_file(start: Path | None = None, search: bool = True) -> tuple[Path, dict]:
+    """Tìm thẻ lease: leo từ cwd lên trước; không có thì dò các worktree của CHÍNH session này."""
+    p = (start or Path.cwd()).resolve()
+    for cand in [p] + list(p.parents):
+        f = cand / LEASE_FILE
+        if f.is_file():
+            return cand, json.loads(f.read_text())
+
+    if search:  # tiện dụng: gọi tal từ gốc repo vẫn nhận ra worktree của mình
+        mine = []
+        for f in sorted(C.worktrees_dir.glob(f"*/{LEASE_FILE}")):
+            try:
+                d = json.loads(f.read_text())
+            except Exception:
+                continue
+            if d.get("session") == session_id() and not d.get("released"):
+                mine.append((f.parent, d))
+        if len(mine) == 1:
+            return mine[0]
+        if len(mine) > 1:
+            raise Fail(
+                "session này đang giữ nhiều worktree: "
+                + ", ".join(f"#{d['issue']}" for _, d in mine)
+                + " — hãy `cd` vào worktree cần dùng rồi chạy lại", 3)
+
+    raise Fail(f"không thấy {LEASE_FILE} — bạn không ở trong worktree của một issue đã nhận", 3)
+
+
+def do_assert(quiet: bool = False) -> dict:
+    wt, lf = lease_file()
+    anchor = lf.get("anchor", lf["issue"])
+    key = f"issue-{anchor}"
+    if not ref_exists(key):
+        raise Fail(f"HẾT LEASE: ref {key} không còn. DỪNG mọi thao tác ghi, đừng push.", 4)
+    led, _, upd = ledger_read(anchor)
+    lease = led.get("lease") or {}
+    if lease.get("session") != lf["session"]:
+        raise Fail(f"MẤT LEASE: sổ ghi chủ hiện tại là {lease.get('session','(trống)')[:8]}…, không phải bạn. DỪNG.", 4)
+    if lease.get("epoch") != lf["epoch"]:
+        raise Fail(f"FENCED: epoch của bạn={lf['epoch']} nhưng sổ={lease.get('epoch')}. Lease đã bị cấp lại. DỪNG.", 4)
+    if lease_expired(led, upd):
+        raise Fail("LEASE QUÁ HẠN (theo đồng hồ server): chạy `tal renew` sớm hơn, hoặc nhận lại issue.", 4)
+    left = (upd + timedelta(seconds=lease.get("ttl", TTL))) - now()
+
+    # Lô: ref của TỪNG thành viên là căn cứ riêng. Ref nào biến mất nghĩa là gc đã thu
+    # hồi và issue đó có thể đã sang tay người khác — commit của nó trong lô này thành
+    # rác. Không chặn ở đây (còn 19 issue kia đang làm dở), nhưng `tal pr` thì chặn.
+    lost: list[int] = []
+    if lf.get("kind") == "batch":
+        live = set(refs_all())
+        lost = [n for n in lf.get("issues", []) if f"issue-{n}" not in live]
+
+    out = {"issue": anchor, "anchor": anchor, "batch": lf.get("batch"),
+           "kind": lf.get("kind", "issue"), "issues": lf.get("issues", lf.get("group", [anchor])),
+           "epoch": lf["epoch"], "worktree": str(wt), "branch": lf.get("branch"),
+           "expires_in_sec": int(left.total_seconds()), "group": lf["group"], "lost": lost}
+    if lost:
+        warn(f"MẤT LEASE của {', '.join('#' + str(n) for n in lost)} — chạy "
+             f"`tal batch drop <N>` cho từng cái trước khi mở PR")
+    if not quiet:
+        label = lf.get("batch") or f"#{anchor}"
+        print(f"lease OK — {label} epoch={lf['epoch']} còn {human_delta(left.total_seconds())}"
+              + (f" · MẤT {len(lost)} issue" if lost else ""))
+    return out
+
+
+def cmd_assert(a):
+    return emit(do_assert(quiet=a.json), a.json)
+
+
+def cmd_renew(a):
+    _, lf = lease_file()
+    led, cid, _ = ledger_read(lf["issue"])
+    lease = led.get("lease") or {}
+    if lease.get("session") != lf["session"] or lease.get("epoch") != lf["epoch"]:
+        raise Fail("không gia hạn được: lease không còn thuộc session này", 4)
+    lease["expires_at"] = iso(now() + timedelta(seconds=lease.get("ttl", TTL)))
+    ledger_write(led, cid, None)
+    print(f"gia hạn #{lf['issue']} thêm {human_delta(lease.get('ttl', TTL))}")
+
+
+def release(issue: int, state: str, labels: set[str], note: str, keep_worktree: bool = True,
+            drop: set[str] | None = None):
+    led, cid, _ = ledger_read(issue)
+    keys = (led.get("lease") or {}).get("keys") or [f"issue-{issue}"]
+    branch = led.get("branch") or f"issue-{issue}"
+    led["state"] = state
+    led["lease"] = None
+    ledger_write(led, cid, note)
+    for k in keys:
+        ref_delete(k)
+        local_unlock(k)
+    for n in led.get("group", [issue]):
+        set_state_labels(n, labels, drop)
+    mark_lease_released(issue, branch)
+    if not keep_worktree:
+        remove_worktree_branch(branch)
+
+
+def cmd_release(a):
+    try:
+        _, lf = lease_file()
+        issue = lf["issue"]
+    except Fail:
+        if not a.issue:
+            raise
+        issue = a.issue
+    # `abandon` trả issue VỀ hàng đợi (mình bỏ, ai lấy cũng được). `no-op` thì khác hẳn:
+    # đã kiểm và KHÔNG có gì phải làm. Hai cái này từng dùng chung một đường, và hậu quả
+    # là issue "không có gì làm" bị nhặt lại mỗi lượt vì nhãn cổng `ready` vẫn còn —
+    # attempts leo dần rồi tới lần thứ MAX_ATTEMPTS+1 nó bị dán dead-letter như thể độc.
+    # Nên `no-op` tháo luôn nhãn cổng: quyền quyết định (đóng issue, hay giữ làm ghi chú
+    # về một mìn chưa nổ) trả về cho người.
+    mapping = {
+        "review":  ("review", {L_REVIEWING, L_AWAIT}, set()),
+        "blocked": ("blocked", {L_BLOCKED}, set()),
+        "abandon": ("queued", set(), set()),
+        "no-op":   ("no_op", set(), {L_READY}),
+        "shipped": ("shipped", {L_SHIPPED}, set()),
+    }
+    state, labels, drop = mapping[a.state]
+    if a.state == "no-op" and not a.note:
+        raise Fail("--state no-op bắt buộc có --note: nói rõ đã kiểm những gì mới kết luận "
+                   "là không có việc", 2)
+    release(issue, state, labels, a.note or f"release → {a.state}", drop=drop)
+    if drop:
+        print(f"đã nhả lease #{issue} → {a.state}, tháo nhãn {', '.join(sorted(drop))} "
+              "(issue không còn tự vào hàng đợi; người quyết đóng hay giữ)")
+    else:
+        print(f"đã nhả lease #{issue} → {a.state}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LÔ — đơn vị công việc thật sự
+#
+# Chi phí cố định của một vòng (claim, dựng worktree, review, CI, merge, gc) gần như
+# KHÔNG phụ thuộc số issue trong đó. Trả chi phí ấy cho từng issue một là nhân nó lên
+# 10–20 lần mà không mua thêm được gì — đó là lý do một sửa text từng mất cả tiếng.
+#
+# Đổi lại, một issue hỏng có thể giữ con tin cả lô. Rào cho việc đó là `batch drop`:
+# mỗi commit mang `(#N)` nên gỡ đúng phần của một issue ra là thao tác cơ học.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def batch_new_id() -> str:
+    return "batch-" + now().strftime("%Y%m%d-%H%M")
+
+
+def batch_commit_map(wt: Path, issues: list[int]) -> tuple[dict[int, list[str]], list[tuple[str, str]]]:
+    """→ ({issue: [sha…]}, [(sha, subject) không map được]).
+
+    Map bằng `#N` trong tiêu đề commit. Commit không map được về ĐÚNG MỘT issue của lô
+    là commit không gỡ ra được — `tal pr` chặn ở đó, vì mất khả năng gỡ là mất luôn cái
+    khiến gom lô an toàn."""
+    out = run(["git", "log", "--no-merges", "--reverse", "--format=%H%x09%s",
+               f"origin/{BASE_BRANCH}..HEAD"], cwd=str(wt)).stdout
+    mapped: dict[int, list[str]] = {}
+    orphan: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        sha, _, subj = line.partition("\t")
+        nums = {int(x) for x in re.findall(r"#(\d+)", subj)} & set(issues)
+        if len(nums) == 1:
+            mapped.setdefault(nums.pop(), []).append(sha)
+        else:
+            orphan.append((sha[:9], subj))
+    return mapped, orphan
+
+
+def batch_ledger_note(issue: int, anchor: int, bid: str, keys: list[str], epoch: int,
+                      cid_hint: int | None = None) -> int:
+    """Sổ của một issue THÀNH VIÊN lô. Đồng hồ lease nằm ở sổ issue neo (`anchor`), nên
+    heartbeat chỉ chạm một sổ."""
+    led, cid, _ = ledger_read(issue)
+    led["batch"] = bid
+    led["branch"] = bid
+    led["epoch"] = max(led.get("epoch", 0), epoch)
+    led["attempts"] = led.get("attempts", 0) + 1
+    led["state"] = "executing"
+    led["lease"] = {
+        "key": f"issue-{issue}", "keys": keys, "epoch": epoch, "anchor": anchor,
+        "batch": bid, "session": session_id(), "host": socket.gethostname(),
+        "pid": os.getpid(), "ttl": TTL, "acquired_at": iso(now()),
+        "expires_at": iso(now() + timedelta(seconds=TTL)),
+    }
+    return ledger_write(led, cid, f"vào lô {bid} (neo #{anchor}) epoch={epoch} session={session_id()[:8]}")
+
+
+def cmd_batch_claim(a):
+    size = a.size or BATCH_MAX
+    need = a.min if a.min is not None else BATCH_MIN
+    if size < need:
+        raise Fail(f"--size {size} nhỏ hơn --min {need}", 2)
+
+    if a.issues:
+        want = [int(x) for x in re.split(r"[,\s]+", a.issues) if x.strip()]
+        cands = [{"number": n, "title": issue_data(n)["title"]} for n in want]
+    else:
+        eligible, _ = queue_eligible()
+        cands = eligible[: size * 2]      # dư ra để bù phần bị session khác giành mất
+
+    if not a.issues and len(cands) < need and not a.force:
+        raise Fail(
+            f"chỉ có {len(cands)} issue đủ điều kiện, cần tối thiểu {need}.\n"
+            f"Lô nhỏ hơn {need} thì chi phí một vòng (review + CI + merge) lại đè lên quá ít "
+            f"việc — đúng cái đang phải chữa. Gắn nhãn {L_READY} cho issue khác, hoặc "
+            f"`--min {len(cands)}` nếu người yêu cầu chạy lô nhỏ.", BUSY)
+
+    bid = batch_new_id()
+    sha = head_sha()
+    taken: list[int] = []            # issue gốc đã giành được
+    all_issues: list[int] = []       # gồm cả sub-issue theo nhóm
+    keys: list[str] = []
+    lost: list[dict] = []
+
+    for c in cands:
+        if len(taken) >= size:
+            break
+        n = c["number"]
+        if n in all_issues:
+            continue
+        root, group = resolve_group(n)
+        if root != n and root in taken:
+            continue
+        gkeys = [f"issue-{x}" for x in group]
+        got: list[str] = []
+        try:
+            for k in gkeys:
+                if not local_lock(k):
+                    raise Fail(f"{k}: session khác trên máy này đang giữ", BUSY)
+                if not ref_create(k, sha):
+                    local_unlock(k)
+                    raise Fail(f"{k}: session khác đang giữ lease", BUSY)
+                got.append(k)
+        except Fail as e:
+            for k in got:                # trong MỘT nhóm vẫn là all-or-nothing
+                ref_delete(k)
+                local_unlock(k)
+            lost.append({"issue": n, "why": str(e)})
+            continue                     # nhưng cả LÔ thì không: bỏ cái này, lấy cái sau
+        taken.append(root)
+        all_issues += group
+        keys += gkeys
+
+    if not taken:
+        raise Fail("không giành được issue nào — mọi ứng viên đang có chủ", BUSY)
+    if len(taken) < need and not a.force:
+        for k in keys:
+            ref_delete(k)
+            local_unlock(k)
+        raise Fail(f"chỉ giành được {len(taken)}/{need} issue (bị session khác lấy mất "
+                   f"{len(lost)}) — đã nhả hết, thử lại lượt sau", BUSY)
+
+    anchor = taken[0]
+    epoch_led, epoch_cid, _ = ledger_read(anchor)
+    epoch = epoch_led.get("epoch", 0) + 1
+
+    wt = ensure_worktree(bid)
+    epoch_led["batch"] = bid
+    epoch_led["group"] = all_issues
+    epoch_led["branch"] = bid
+    epoch_led["epoch"] = epoch
+    epoch_led["attempts"] = epoch_led.get("attempts", 0) + 1
+    epoch_led["state"] = "executing"
+    epoch_led["lease"] = {
+        "key": f"issue-{anchor}", "keys": keys, "epoch": epoch, "anchor": anchor,
+        "batch": bid, "session": session_id(), "host": socket.gethostname(),
+        "pid": os.getpid(), "ttl": TTL, "acquired_at": iso(now()),
+        "expires_at": iso(now() + timedelta(seconds=TTL)), "worktree": str(wt),
+    }
+    cid = ledger_write(epoch_led, epoch_cid,
+                       f"NEO lô {bid}: {len(taken)} issue, epoch={epoch}, "
+                       f"session={session_id()[:8]} wt={wt.name}")
+
+    for n in all_issues:
+        if n != anchor:
+            batch_ledger_note(n, anchor, bid, [f"issue-{n}"], epoch)
+        set_state_labels(n, {L_WORKING})
+
+    (wt / LEASE_FILE).write_text(json.dumps({
+        "repo": C.repo, "kind": "batch", "batch": bid, "anchor": anchor,
+        "issue": anchor, "issues": all_issues, "group": all_issues, "branch": bid,
+        "epoch": epoch, "session": session_id(), "keys": keys,
+        "comment_id": cid, "acquired_at": epoch_led["lease"]["acquired_at"],
+    }, indent=2))
+
+    out = {"batch": bid, "anchor": anchor, "issues": all_issues, "branch": bid,
+           "worktree": str(wt), "epoch": epoch, "ttl": TTL, "base": BASE_BRANCH,
+           "lost": lost, "session": session_id(),
+           "titles": {c["number"]: c["title"] for c in cands if c["number"] in all_issues}}
+    if a.json:
+        return emit(out, True)
+    print(f"lô {bid} — {len(all_issues)} issue, neo #{anchor}, epoch={epoch}")
+    for n in all_issues:
+        t = out["titles"].get(n, "")
+        print(f"  #{n:<6} {t[:70]}")
+    if lost:
+        print(f"\n{len(lost)} issue bị session khác giành mất, đã bỏ khỏi lô")
+    print(f"\nworktree: {wt}\nbranch:   {bid} (từ origin/{BASE_BRANCH})")
+    print("Mỗi commit BẮT BUỘC mang `(#N)` — đó là thứ cho phép `tal batch drop <N>` "
+          "gỡ một issue ra mà không đụng phần còn lại.")
+    return out
+
+
+def cmd_batch_status(a):
+    wt, lf = lease_file()
+    if lf.get("kind") != "batch":
+        raise Fail("worktree này không phải một lô", 2)
+    mapped, orphan = batch_commit_map(wt, lf["issues"])
+    rows = [{"issue": n, "commits": len(mapped.get(n, [])),
+             "done": bool(mapped.get(n))} for n in lf["issues"]]
+    files = run(["git", "diff", "--name-only", f"origin/{BASE_BRANCH}...HEAD"],
+                cwd=str(wt)).stdout.split()
+    out = {"batch": lf["batch"], "anchor": lf["anchor"], "issues": rows,
+           "orphan_commits": orphan, "files": files, "worktree": str(wt)}
+    if a.json:
+        return emit(out, True)
+    print(f"lô {lf['batch']} · neo #{lf['anchor']} · {len(files)} file đã đổi\n")
+    for r in rows:
+        print(f"  {'✔' if r['done'] else '·'} #{r['issue']:<6} {r['commits']} commit")
+    todo = [r["issue"] for r in rows if not r["done"]]
+    if todo:
+        print(f"\nchưa có commit: {', '.join('#' + str(x) for x in todo)}")
+    if orphan:
+        print(f"\n{len(orphan)} commit KHÔNG map được về một issue của lô — `tal pr` sẽ chặn:")
+        for sha, subj in orphan:
+            print(f"  {sha}  {subj[:70]}")
+    return out
+
+
+def cmd_batch_drop(a):
+    """Gỡ MỘT issue ra khỏi lô: revert commit của nó, nhả lease, trả issue về hàng đợi.
+
+    Đây là cái làm cho gom lô không biến một issue hỏng thành con tin của 19 issue kia."""
+    st = do_assert(quiet=True)
+    wt, lf = lease_file()
+    if lf.get("kind") != "batch":
+        raise Fail("worktree này không phải một lô — dùng `tal release` cho issue đơn", 2)
+    n = a.issue
+    if n not in lf["issues"]:
+        raise Fail(f"#{n} không nằm trong lô {lf['batch']}", 2)
+    if len(lf["issues"]) == 1:
+        raise Fail("lô chỉ còn một issue — dùng `tal release --state abandon`", 2)
+
+    mapped, _ = batch_commit_map(wt, lf["issues"])
+    shas = mapped.get(n, [])
+    if shas and not a.keep_commits:
+        dirty = run(["git", "status", "--porcelain"], cwd=str(wt)).stdout.strip()
+        if dirty:
+            raise Fail(f"worktree còn thay đổi chưa commit — commit hoặc stash trước khi "
+                       f"gỡ #{n} khỏi lô:\n{dirty}", 2)
+        for sha in reversed(shas):
+            r = run(["git", "revert", "--no-edit", sha], cwd=str(wt), check=False)
+            if r.returncode != 0:
+                run(["git", "revert", "--abort"], cwd=str(wt), check=False)
+                raise Fail(
+                    f"revert {sha[:9]} đụng conflict — commit của #{n} đã bị commit sau đó "
+                    f"chồng lên. Giải bằng tay rồi chạy lại với --keep-commits, hoặc bỏ cả lô.\n"
+                    f"{r.stdout}\n{r.stderr}", 2)
+
+    ref_delete(f"issue-{n}")
+    local_unlock(f"issue-{n}")
+    led, cid, _ = ledger_read(n)
+    led["lease"] = None
+    led["batch"] = None
+    led["state"] = "blocked" if a.blocked else "queued"
+    ledger_write(led, cid, f"gỡ khỏi lô {lf['batch']}: {a.reason or 'không nêu lý do'}"
+                           + (f" (đã revert {len(shas)} commit)" if shas and not a.keep_commits else ""))
+    set_state_labels(n, {L_BLOCKED} if a.blocked else set())
+
+    lf["issues"] = [x for x in lf["issues"] if x != n]
+    lf["group"] = lf["issues"]
+    lf["keys"] = [k for k in lf["keys"] if k != f"issue-{n}"]
+    (wt / LEASE_FILE).write_text(json.dumps(lf, indent=2))
+
+    aled, acid, _ = ledger_read(lf["anchor"])
+    aled["group"] = lf["issues"]
+    if aled.get("lease"):
+        aled["lease"]["keys"] = lf["keys"]
+    ledger_write(aled, acid, f"lô {lf['batch']}: gỡ #{n} ({a.reason or 'không nêu lý do'})")
+
+    pr = aled.get("pr")
+    if pr:
+        body = gh_json(["pr", "view", str(pr), "-R", C.repo, "--json", "body", "-q", ".body"], default="")
+        if isinstance(body, str) and f"Closes #{n}" in body:
+            body = "\n".join(l for l in body.splitlines() if l.strip() != f"Closes #{n}")
+            gh(["pr", "edit", str(pr), "-R", C.repo, "--body", body], check=False)
+        gh(["pr", "comment", str(pr), "-R", C.repo, "-b",
+            f"<!-- {REVIEW_MARKER}:drop -->\n#{n} đã được gỡ khỏi lô này "
+            f"({a.reason or 'không nêu lý do'}) và trả về hàng đợi."], check=False)
+
+    print(f"đã gỡ #{n} khỏi lô {lf['batch']}"
+          + (f", revert {len(shas)} commit" if shas and not a.keep_commits else "")
+          + f" — còn {len(lf['issues'])} issue")
+    return {"batch": lf["batch"], "dropped": n, "reverted": len(shas) if not a.keep_commits else 0,
+            "remaining": lf["issues"], "epoch": st["epoch"]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test — CHỈ test liên quan. Full suite không thuộc về vòng lặp.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def affected_commands(files: list[str]) -> tuple[list[str], list[dict]]:
+    """Test Impact Analysis: đường dẫn đã đổi → đúng những lệnh test phải chạy."""
+    rules = CFG.get("affectedTests") or []
+    cmds: list[str] = []
+    hits: list[dict] = []
+    for r in rules:
+        pat = r.get("when")
+        if not pat:
+            continue
+        matched = [f for f in files if re.search(pat, f)]
+        if not matched:
+            continue
+        hits.append({"when": pat, "why": r.get("why", ""), "files": matched[:5],
+                     "run": r.get("run") or []})
+        for c in r.get("run") or []:
+            if c not in cmds:
+                cmds.append(c)
+    return cmds, hits
+
+
+def cmd_tests(a):
+    if a.pr:
+        files = gh(["pr", "diff", str(a.pr), "-R", C.repo, "--name-only"],
+                   check=False).stdout.split()
+        wt = C.main_worktree
+    else:
+        wt, _ = lease_file()
+        run(["git", "fetch", "-q", "origin", BASE_BRANCH], cwd=str(wt), check=False)
+        files = run(["git", "diff", "--name-only", f"origin/{BASE_BRANCH}...HEAD"],
+                    cwd=str(wt)).stdout.split()
+        files += [l[3:] for l in
+                  run(["git", "status", "--porcelain"], cwd=str(wt)).stdout.splitlines()]
+    files = sorted(set(f for f in files if f))
+    cmds, hits = affected_commands(files)
+
+    if a.json:
+        return emit({"files": files, "rules": hits, "commands": cmds,
+                     "has_rules": bool(CFG.get("affectedTests"))}, True)
+    if not CFG.get("affectedTests"):
+        print("chưa khai `affectedTests` trong config — không suy ra được test liên quan.\n"
+              "Khai nó, hoặc chạy theo `policyDocs.test`. KHÔNG chạy full suite.")
+        return {"commands": []}
+    print(f"{len(files)} file đã đổi → {len(cmds)} lệnh test liên quan")
+    for h in hits:
+        print(f"  · {h['when']}  ({', '.join(h['files'][:3])}{'…' if len(h['files']) > 3 else ''})")
+    if not cmds:
+        print("  không luật nào khớp — không có test liên quan để chạy")
+    for c in cmds:
+        print(f"  $ {c}")
+    if not a.run:
+        return {"commands": cmds}
+
+    failed = []
+    for c in cmds:
+        print(f"\n$ {c}")
+        r = run(["bash", "-lc", c], cwd=str(wt), check=False)
+        tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-20:])
+        print(tail)
+        if r.returncode != 0:
+            failed.append(c)
+    if failed:
+        raise Fail(f"{len(failed)}/{len(cmds)} lệnh test ĐỎ:\n  " + "\n  ".join(failed), 2)
+    print(f"\n{len(cmds)} lệnh test liên quan: XANH")
+    return {"commands": cmds, "failed": failed}
+
+
+def cmd_fullsuite(a):
+    """Full suite. KHÔNG phải một bước của vòng lặp.
+
+    Nó chạy ở CI của PR vào `mainBranch`, hoặc khi NGƯỜI gõ lệnh này. Chạy nó cho từng
+    issue — hay từng lô — là trả hàng chục phút cho một câu hỏi mà CI của PR vào main
+    trả lời đúng hơn và không giữ session nào."""
+    cmds = CFG.get("fullSuite") or []
+    if not cmds:
+        raise Fail("chưa khai `fullSuite` trong .claude/agent-loop.json", 2)
+    here = Path.cwd().resolve()
+    if not a.force and str(here).startswith(str(C.worktrees_dir.resolve())):
+        raise Fail(
+            "đang đứng trong worktree của vòng lặp — full suite BỊ CẤM ở đây.\n"
+            "Vòng lặp chỉ chạy test liên quan (`tal tests --run`). Full suite chạy ở CI của "
+            f"PR vào {MAIN_BRANCH} (`tal release-to-main`), hoặc gõ lệnh này từ gốc repo.", 2)
+    failed = []
+    for c in cmds:
+        print(f"$ {c}")
+        r = run(["bash", "-lc", c], cwd=str(C.main_worktree), check=False)
+        print("\n".join((r.stdout + r.stderr).strip().splitlines()[-25:]))
+        if r.returncode != 0:
+            failed.append(c)
+    if failed:
+        raise Fail(f"full suite ĐỎ: {len(failed)}/{len(cmds)} lệnh", 2)
+    print(f"full suite XANH ({len(cmds)} lệnh)")
+    return {"commands": cmds, "failed": failed}
+
+
+def cmd_release_to_main(a):
+    """Mở PR {base} → {main}. ĐÂY là chỗ full suite chạy, một lần, trong CI."""
+    root = str(C.main_worktree)
+    run(["git", "fetch", "-q", "origin", BASE_BRANCH, MAIN_BRANCH], cwd=root, check=False)
+    log = run(["git", "log", "--oneline", "--no-merges",
+               f"origin/{MAIN_BRANCH}..origin/{BASE_BRANCH}"], cwd=root).stdout.strip()
+    if not log:
+        print(f"origin/{BASE_BRANCH} không có gì mới so với origin/{MAIN_BRANCH}")
+        return {"pr": None}
+    n = len(log.splitlines())
+    existing = [x for x in gh_json(["pr", "list", "-R", C.repo, "--base", MAIN_BRANCH,
+                                    "--head", BASE_BRANCH, "--json", "number,url,state"],
+                                   default=[]) if x["state"] == "OPEN"]
+    body = (a.body_file and Path(a.body_file).read_text()) or (
+        f"Gộp `{BASE_BRANCH}` → `{MAIN_BRANCH}`: {n} commit.\n\n"
+        f"Full suite chạy ở CI của PR này — đây là lần DUY NHẤT nó chạy trong cả chu kỳ.\n\n"
+        "<details><summary>commit</summary>\n\n```\n" + log + "\n```\n\n</details>\n")
+    title = a.title or f"release: {BASE_BRANCH} → {MAIN_BRANCH} ({n} commit)"
+    if existing:
+        pr = existing[0]
+        gh(["pr", "edit", str(pr["number"]), "-R", C.repo, "--title", title, "--body", body])
+        print(f"cập nhật PR release #{pr['number']} {pr['url']} ({n} commit)")
+        return {"pr": pr["number"], "commits": n}
+    url = gh(["pr", "create", "-R", C.repo, "--base", MAIN_BRANCH, "--head", BASE_BRANCH,
+              "--title", title, "--body", body]).stdout.strip()
+    print(f"mở PR release {url} ({n} commit) — full suite chạy ở CI của PR này")
+    return {"pr": int(url.rstrip("/").split("/")[-1]), "commits": n}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worktree + submodule
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def branch_exists_local(br: str) -> bool:
+    return run(["git", "rev-parse", "--verify", "-q", f"refs/heads/{br}"],
+               cwd=str(C.main_worktree), check=False).returncode == 0
+
+
+def branch_exists_remote(br: str, cwd: Path | None = None) -> bool:
+    p = run(["git", "ls-remote", "--exit-code", "--heads", "origin", br],
+            cwd=str(cwd or C.main_worktree), check=False)
+    return p.returncode == 0
+
+
+def ensure_worktree(branch: str) -> Path:
+    assert_branch_name(branch, "umbrella")
+    root = C.main_worktree
+    path = C.worktrees_dir / branch               # tên worktree = tên branch, luôn khớp
+    path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "fetch", "-q", "--prune", "origin"], cwd=str(root), check=False)
+
+    if path.exists():
+        cur = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(path), check=False)
+        if cur.returncode == 0 and cur.stdout.strip() == branch:
+            exclude_lease(path)
+            return path
+        raise Fail(f"{path} đã tồn tại nhưng đang ở branch {cur.stdout.strip()!r}, không phải {branch}")
+
+    if branch_exists_local(branch):
+        run(["git", "worktree", "add", str(path), branch], cwd=str(root))
+    elif branch_exists_remote(branch):
+        run(["git", "worktree", "add", "-b", branch, str(path), f"origin/{branch}"], cwd=str(root))
+    else:
+        run(["git", "worktree", "add", "-b", branch, str(path), f"origin/{BASE_BRANCH}"], cwd=str(root))
+    exclude_lease(path)
+    return path
+
+
+def exclude_lease(path: Path):
+    """Thẻ lease không được lọt vào commit — ghi vào info/exclude RIÊNG của worktree,
+    để không phụ thuộc việc .gitignore đã commit hay chưa."""
+    # Worktree phụ KHÔNG có info/exclude riêng — git đọc từ common dir. Ghi sai chỗ là
+    # luật ignore không có tác dụng và .tal-lease.json lọt vào `git status`.
+    gd = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+             cwd=str(path), check=False).stdout.strip()
+    if not gd:
+        return
+    ex = Path(gd) / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    cur = ex.read_text() if ex.is_file() else ""
+    if LEASE_FILE not in cur:
+        ex.write_text(cur.rstrip("\n") + f"\n{LEASE_FILE}\n")
+
+
+def remove_worktree_branch(branch: str):
+    path = C.worktrees_dir / branch
+    root = str(C.main_worktree)
+    if path.exists():
+        run(["git", "worktree", "remove", "--force", str(path)], cwd=root, check=False)
+    run(["git", "worktree", "prune"], cwd=root, check=False)
+    if branch_exists_local(branch):
+        run(["git", "branch", "-D", branch], cwd=root, check=False)
+
+
+def remove_worktree(issue: int):
+    remove_worktree_branch(f"issue-{issue}")
+
+
+def submodules() -> dict[str, dict]:
+    txt = run(["git", "config", "-f", str(C.main_worktree / ".gitmodules"),
+               "--get-regexp", r"^submodule\..*"], check=False).stdout
+    subs: dict[str, dict] = {}
+    for line in txt.splitlines():
+        k, _, v = line.partition(" ")
+        m = re.match(r"submodule\.(.+)\.(path|url|branch)$", k)
+        if m:
+            subs.setdefault(m.group(1), {})[m.group(2)] = v.strip()
+    for name, s in subs.items():
+        s["name"] = name
+        s["repo"] = re.sub(r"(\.git)?$", "", re.sub(r"^.*[:/]([^/:]+/[^/]+?)$", r"\1", s.get("url", "")))
+        s.setdefault("branch", BASE_BRANCH)
+    return subs
+
+
+def sub_base(s: dict) -> str:
+    """Base cho PR của submodule. Mặc định là trường `branch` trong .gitmodules —
+    tức đúng nhánh mà umbrella theo dõi — KHÔNG phải default branch trên GitHub.
+    Nhiều repo để default = main và gắn CI/CD auto-deploy vào đó; merge một PR review
+    vào main là đẩy production. Repo nào thật sự muốn default branch thì khai
+    `"submodulePrBase": "default"` trong config."""
+    if CFG.get("submodulePrBase") == "default" and s.get("repo"):
+        d = gh(["api", f"repos/{s['repo']}", "-q", ".default_branch"], check=False).stdout.strip()
+        if d:
+            return d
+    return s.get("branch") or BASE_BRANCH
+
+
+def cmd_submodule(a):
+    st = do_assert(quiet=True)
+    wt = Path(st["worktree"])
+    subs = submodules()
+    match = [s for s in subs.values() if s.get("path") == a.path or s["name"] == a.path]
+    if not match:
+        raise Fail(f"không có submodule {a.path!r}; có: {', '.join(sorted(s['path'] for s in subs.values()))}")
+    s = match[0]
+    p = wt / s["path"]
+    run(["git", "submodule", "update", "--init", "--", s["path"]], cwd=str(wt))
+    run(["git", "fetch", "-q", "origin"], cwd=str(p), check=False)
+    br = f"issue-{st['issue']}"
+    base = sub_base(s)
+    if branch_exists_remote(br, p):
+        run(["git", "checkout", "-B", br, f"origin/{br}"], cwd=str(p))
+    else:
+        run(["git", "checkout", "-B", br, f"origin/{base}"], cwd=str(p))
+    out = {"path": str(p), "repo": s["repo"], "branch": br, "base": base}
+    if a.json:
+        return emit(out, True)
+    print(f"submodule {s['path']} → {p}\nrepo {s['repo']}, branch {br} từ origin/{base}")
+    print(f"LƯU Ý: PR của submodule nhắm `{base}` (theo .gitmodules), KHÔNG nhắm default branch.")
+    return out
+
+
+def cmd_submodule_pr(a):
+    st = do_assert(quiet=True)
+    wt = Path(st["worktree"])
+    subs = submodules()
+    match = [s for s in subs.values() if s.get("path") == a.path or s["name"] == a.path]
+    if not match:
+        raise Fail(f"không có submodule {a.path!r}")
+    s = match[0]
+    p = wt / s["path"]
+    br, base, repo = f"issue-{st['issue']}", sub_base(s), s["repo"]
+
+    dirty = run(["git", "status", "--porcelain"], cwd=str(p)).stdout.strip()
+    if dirty:
+        raise Fail(f"{s['path']} còn thay đổi chưa commit:\n{dirty}")
+    run(["git", "push", "--force-with-lease", "-u", "origin", br], cwd=str(p))
+
+    existing = gh_json(["pr", "list", "-R", repo, "--head", br, "--json", "number,url"], default=[])
+    if existing:
+        pr = existing[0]
+    else:
+        title = a.title or f"fix: #{st['issue']} ({s['path']})"
+        body = (Path(a.body_file).read_text() if a.body_file else
+                f"Phần {s['path']} của {C.repo}#{st['issue']}.\n\n"
+                f"Umbrella PR sẽ bump pointer sau khi PR này merge.")
+        out = gh(["pr", "create", "-R", repo, "--base", base, "--head", br,
+                  "--title", title, "--body", body]).stdout.strip()
+        pr = {"url": out, "number": int(out.rstrip("/").split("/")[-1])}
+
+    led, cid, _ = ledger_read(st["issue"])
+    led.setdefault("sub_prs", {})[s["path"]] = {"repo": repo, "pr": pr["number"], "branch": br}
+    ledger_write(led, cid, f"submodule PR {repo}#{pr['number']} ({s['path']})")
+    sha = run(["git", "rev-parse", "HEAD"], cwd=str(p)).stdout.strip()
+    print(f"{repo}#{pr['number']} → {pr.get('url','')}\nsha {sha[:12]} — nhớ bump pointer ở umbrella rồi commit.")
+    return {"repo": repo, "pr": pr["number"], "sha": sha}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cổng kiểm submodule — pointer sai là clone chết, phải chặn bằng máy
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def submodule_audit(wt: Path, issue: int) -> list[dict]:
+    """Soi từng submodule ĐÃ BỊ CHẠM. Mỗi phát hiện là một lỗi chặn PR.
+
+    Bốn kiểu sai đều làm repo hỏng lặng lẽ, nên không có kiểu nào là cảnh báo suông:
+      - pointer trỏ commit chưa push  → ai clone cũng chết ở `submodule update`
+      - pointer khác HEAD của repo con → bump nhầm commit, hoặc quên bump
+      - repo con không ở branch issue-N → mất dấu, không tra được PR nào sinh ra pointer
+      - repo con còn thay đổi chưa commit → pointer chắc chắn sẽ lệch
+    """
+    problems: list[dict] = []
+    br = f"issue-{issue}"
+    run(["git", "fetch", "-q", "origin", BASE_BRANCH], cwd=str(wt), check=False)
+
+    for s in submodules().values():
+        path = s["path"]
+        p = wt / path
+        if not (p / ".git").exists():
+            continue                                    # chưa init = không chạm
+
+        def ptr(ref: str) -> str | None:
+            r = run(["git", "rev-parse", f"{ref}:{path}"], cwd=str(wt), check=False)
+            return r.stdout.strip() if r.returncode == 0 else None
+
+        committed, base = ptr("HEAD"), ptr(f"origin/{BASE_BRANCH}")
+        head = run(["git", "rev-parse", "HEAD"], cwd=str(p), check=False).stdout.strip()
+        cur_br = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(p), check=False).stdout.strip()
+        dirty = run(["git", "status", "--porcelain"], cwd=str(p), check=False).stdout.strip()
+        touched = bool(dirty) or (head and base and head != base) or (committed != base)
+        if not touched:
+            continue
+
+        def bad(kind: str, msg: str):
+            problems.append({"path": path, "repo": s["repo"], "kind": kind, "msg": msg})
+
+        if dirty:
+            bad("dirty", f"{path}: còn {len(dirty.splitlines())} file chưa commit trong repo con")
+        if cur_br != br:
+            bad("branch", f"{path}: đang ở {cur_br!r}, phải là {br!r} — "
+                          f"chạy `tal submodule {path}` để tạo/chuyển đúng branch")
+        if committed != head:
+            bad("pointer", f"{path}: pointer umbrella = {(committed or '(chưa có)')[:12]} nhưng repo con ở "
+                           f"{head[:12]} — QUÊN BUMP. Chạy `git add {path} && git commit`")
+        else:
+            run(["git", "fetch", "-q", "origin", br], cwd=str(p), check=False)
+            pushed = run(["git", "merge-base", "--is-ancestor", head, f"origin/{br}"],
+                         cwd=str(p), check=False).returncode == 0
+            if not pushed:
+                bad("unpushed", f"{path}: pointer {head[:12]} CHƯA có trên origin/{br} — "
+                                f"ai clone cũng chết. Chạy `tal submodule-pr {path}`")
+        if s["repo"]:
+            prs = gh_json(["pr", "list", "-R", s["repo"], "--head", br, "--state", "all",
+                           "--json", "number,state"], default=[])
+            if not prs:
+                bad("no-pr", f"{path}: chưa có PR nào cho {br} ở {s['repo']} — "
+                             f"chạy `tal submodule-pr {path}`")
+    return problems
+
+
+def cmd_submodule_check(a):
+    st = do_assert(quiet=True)
+    problems = submodule_audit(Path(st["worktree"]), st["issue"])
+    if a.json:
+        return emit({"issue": st["issue"], "problems": problems}, True)
+    if not problems:
+        print("submodule: không có vấn đề (hoặc không chạm submodule nào)")
+        return 0
+    print(f"submodule: {len(problems)} vấn đề CHẶN PR\n")
+    for x in problems:
+        print(f"  [{x['kind']}] {x['msg']}")
+    return 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR umbrella + bàn giao review
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def cmd_pr(a):
+    st = do_assert(quiet=True)           # fencing: chỉ chủ lease hợp lệ được ghi
+    wt, lf = Path(st["worktree"]), lease_file()[1]
+    issue, branch = lf.get("anchor", lf["issue"]), lf["branch"]
+    group = lf.get("issues") or lf["group"]
+
+    cur = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(wt)).stdout.strip()
+    assert_branch_name(cur, "worktree umbrella")
+    if cur != branch:
+        raise Fail(f"worktree đang ở branch {cur!r} nhưng lease là của {branch!r} — "
+                   "quay về đúng branch của issue trước khi mở PR", 2)
+
+    dirty = run(["git", "status", "--porcelain"], cwd=str(wt)).stdout.strip()
+    if dirty and not a.allow_dirty:
+        raise Fail(f"worktree còn thay đổi chưa commit:\n{dirty}")
+
+    if is_batch(branch):
+        # Lease của thành viên đã mất = commit của nó trong lô này là rác.
+        if st.get("lost"):
+            raise Fail("CHẶN mở PR — mất lease của "
+                       + ", ".join(f"#{n}" for n in st["lost"])
+                       + ". Chạy `tal batch drop <N>` cho từng cái rồi mở lại PR.", 4)
+        # Mỗi commit phải map về ĐÚNG MỘT issue của lô, nếu không `batch drop` mất
+        # hiệu lực và một issue hỏng lại giữ con tin cả lô.
+        mapped, orphan = batch_commit_map(wt, lf["issues"])
+        if orphan and not a.allow_orphan_commits:
+            lines = "\n".join(f"  {sha}  {subj[:70]}" for sha, subj in orphan)
+            raise Fail(
+                f"CHẶN mở PR — {len(orphan)} commit không map được về đúng một issue của lô:\n"
+                f"{lines}\nMỗi tiêu đề commit phải mang `(#N)` với N thuộc lô "
+                f"({', '.join('#' + str(x) for x in lf['issues'])}). Sửa bằng "
+                "`git rebase -i` hoặc `git commit --amend`.", 2)
+        empty = [n for n in lf["issues"] if n not in mapped]
+        if empty and not a.allow_empty_issues:
+            raise Fail(
+                "CHẶN mở PR — không có commit nào cho "
+                + ", ".join(f"#{n}" for n in empty)
+                + ".\nMỗi issue trong lô phải có việc thật, hoặc bị gỡ ra: "
+                "`tal batch drop <N> --reason \"đã kiểm, không có việc\"`.", 2)
+        # Submodule là đường của issue ĐƠN: pointer là sha trơ nên nhánh chạm submodule
+        # phải mang số issue trong tên, mà lô thì không mang được.
+        changed = run(["git", "diff", "--name-only", f"origin/{BASE_BRANCH}...HEAD"],
+                      cwd=str(wt)).stdout.split()
+        touched = sorted({sp for sp in submodules()
+                          for f in changed
+                          if f == sp or f.startswith(sp.rstrip("/") + "/")})
+        if touched:
+            raise Fail(
+                f"CHẶN mở PR — lô chạm submodule: {', '.join(touched)}.\n"
+                "Submodule phải đi đường issue ĐƠN (branch `issue-<số>` ở cả repo con). "
+                "Gỡ issue đó ra bằng `tal batch drop <N> --reason \"chạm submodule\"` rồi "
+                "làm riêng bằng `tal claim <N>`.", 2)
+
+    problems = submodule_audit(wt, issue) if not is_batch(branch) else []
+    if problems and not a.skip_submodule_check:
+        lines = "\n".join(f"  [{x['kind']}] {x['msg']}" for x in problems)
+        raise Fail(
+            f"CHẶN mở PR — {len(problems)} vấn đề submodule (pointer sai/quên bump là clone chết):\n"
+            f"{lines}\nSửa xong rồi chạy lại. Chỉ dùng --skip-submodule-check nếu người yêu cầu.", 2
+        )
+
+    run(["git", "fetch", "-q", "origin", BASE_BRANCH], cwd=str(wt), check=False)
+    ahead = run(["git", "rev-list", "--count", f"origin/{BASE_BRANCH}..HEAD"], cwd=str(wt)).stdout.strip()
+    if ahead == "0":
+        raise Fail(f"không có commit nào so với origin/{BASE_BRANCH} — chưa có gì để mở PR", 2)
+
+    run(["git", "push", "--force-with-lease", "-u", "origin", branch], cwd=str(wt))
+
+    existing = gh_json(["pr", "list", "-R", C.repo, "--head", branch, "--json", "number,url,state"], default=[])
+    existing = [p for p in existing if p["state"] == "OPEN"]
+    closes = "\n".join(f"Closes #{n}" for n in group)
+
+    title = a.title or (f"{'chore' if len(group) > 1 else 'fix'}: "
+                        + (f"lô {branch} — {len(group)} issue" if is_batch(branch)
+                           else issue_data(issue)["title"]))
+    if not CONVENTIONAL.match(title):
+        warn(f"tiêu đề PR không theo Conventional Commits: {title!r}")
+    body = Path(a.body_file).read_text() if a.body_file else (a.body or "")
+    if "Closes #" not in body:
+        body = (body.rstrip() + "\n\n" + closes).strip()
+
+    if existing:
+        pr = existing[0]
+        # #1335: PR đã tồn tại thì --title/--body-file TỪNG bị nuốt im lặng, nên thân PR
+        # kẹt ở vòng 1 và reviewer đọc mô tả sai rồi trả về một PR đã sửa. Ghi thật, ở đây,
+        # thay vì dạy mọi skill một nghi thức "nhớ đọc lại rồi gh pr edit".
+        args = ["pr", "edit", str(pr["number"]), "-R", C.repo]
+        if a.title:
+            args += ["--title", title]
+        if a.body_file or a.body:
+            args += ["--body", body]
+        if len(args) > 4:
+            gh(args)
+        # Bản mới làm MẤT HIỆU LỰC lần review trước — tháo nhãn pass khỏi PR, nếu không
+        # nó sống sót và làm rào merge tưởng PR này đã được review.
+        gh(["pr", "edit", str(pr["number"]), "-R", C.repo, "--remove-label", L_PASSED], check=False)
+        gh(["pr", "comment", str(pr["number"]), "-R", C.repo, "-b",
+            f"<!-- {REVIEW_MARKER}:push -->\nĐã đẩy bản sửa mới (epoch {st['epoch']}). "
+            f"Nhãn `{L_PASSED}` đã được tháo — cần review lại."])
+    else:
+        url = gh(["pr", "create", "-R", C.repo, "--base", BASE_BRANCH, "--head", branch,
+                  "--title", title, "--body", body]).stdout.strip()
+        pr = {"number": int(url.rstrip("/").split("/")[-1]), "url": url}
+
+    led, cid, _ = ledger_read(issue)
+    led["pr"] = pr["number"]
+    led["state"] = "review"
+    led["lease"] = None
+    ledger_write(led, cid, f"PR #{pr['number']} mở, bàn giao review (worker session {lf['session'][:8]}…)")
+    for n in group:
+        if n == issue:
+            continue
+        nled, ncid, _ = ledger_read(n)
+        nled["pr"] = pr["number"]
+        nled["state"] = "review"
+        nled["lease"] = None
+        ledger_write(nled, ncid, f"PR #{pr['number']} (lô {branch}) mở, chờ review")
+    for k in lf["keys"]:
+        ref_delete(k)
+        local_unlock(k)
+    mark_lease_released(lf["issue"], branch)
+    for n in group:
+        set_state_labels(n, {L_REVIEWING, L_AWAIT})
+
+    print(f"PR #{pr['number']} {pr.get('url','')}\nđã nhả lease, "
+          + (f"lô {branch} ({len(group)} issue)" if is_batch(branch) else f"#{issue}")
+          + " → chờ review")
+    print("worktree giữ lại để vòng sửa sau dùng lại; `tal gc` sẽ dọn khi PR merge.")
+    return {"pr": pr["number"], "issue": issue}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vai review
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Branch mà vòng lặp quản: issue đơn, hoặc một lô.
+TRACKED_HEAD = re.compile(r"^(issue-\d+|batch-\d{8}-\d{4})$")
+
+
+def issues_from(head: str | None, body: str | None) -> list[int]:
+    """Issue mà một PR đóng. Nhánh đơn đọc từ tên; lô đọc từ các dòng `Closes #N` —
+    dòng đầu là issue NEO, nơi giữ sổ của cả lô."""
+    m = re.match(r"^issue-(\d+)$", head or "")
+    if m:
+        return [int(m.group(1))]
+    seen, out = set(), []
+    for x in re.findall(r"(?:closes|fixes|resolves)\s+#(\d+)", body or "", re.I):
+        n = int(x)
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def pr_issues(pr: int) -> list[int]:
+    d = gh_json(["pr", "view", str(pr), "-R", C.repo, "--json", "headRefName,body,number"], default={})
+    out = issues_from(d.get("headRefName"), d.get("body"))
+    if out:
+        return out
+    raise Fail(f"PR #{pr} không suy ra được issue (branch {d.get('headRefName')!r})")
+
+
+def pr_issue(pr: int) -> int:
+    """Issue NEO của PR — nơi giữ sổ và nhãn điều khiển rào merge."""
+    return pr_issues(pr)[0]
+
+
+def cmd_review_queue(a):
+    live = set(refs_all())
+    prs = gh_json(
+        ["pr", "list", "-R", C.repo, "--state", "open", "--limit", "100",
+         "--json", "number,title,headRefName,isDraft,labels,updatedAt,author,body"],
+        default=[],
+    )
+    out = []
+    for p in prs:
+        if p["isDraft"] or not TRACKED_HEAD.match(p["headRefName"]):
+            continue
+        nums = issues_from(p["headRefName"], p.get("body"))
+        if not nums:
+            continue
+        issue = nums[0]
+        names = set(issue_data(issue)["labels"])
+        if L_AWAIT not in names and L_REVIEWING not in names:
+            continue
+        if f"pr-{p['number']}" in live:
+            continue
+        led, _, _ = ledger_read(issue)
+        worker = None
+        for h in reversed(led.get("history", [])):
+            m = re.search(r"worker session (\w+)", h) or re.search(r"session=(\w+)", h)
+            if m:
+                worker = m.group(1)
+                break
+        out.append({"pr": p["number"], "issue": issue, "issues": nums,
+                    "batch": led.get("batch"), "title": p["title"],
+                    "rounds": led.get("review_rounds", 0), "worker": worker,
+                    "updated": p["updatedAt"]})
+    out.sort(key=lambda x: x["updated"])
+    if a.json:
+        return emit({"role": "review", "eligible": out}, True)
+    if not out:
+        print("không có PR nào chờ review")
+    for o in out:
+        tag = f"lô {len(o['issues'])} issue" if len(o["issues"]) > 1 else f"#{o['issue']}"
+        print(f"PR #{o['pr']:<5} ← {tag:<14} vòng {o['rounds']}  {o['title'][:52]}")
+    return out
+
+
+def cmd_review_claim(a):
+    pr = a.pr
+    issue = pr_issue(pr)
+    led, cid, _ = ledger_read(issue)
+
+    worker_sessions = {h.split("session=")[1].split()[0] for h in led.get("history", []) if "session=" in h}
+    mine = session_id()[:8]
+    if mine in worker_sessions and not a.allow_self:
+        raise Fail(
+            f"session này ({mine}…) là session đã code PR #{pr} — tách vai bắt buộc, "
+            "hãy để session khác review (dùng --allow-self nếu người yêu cầu)", 5
+        )
+
+    key = f"pr-{pr}"
+    if not local_lock(key):
+        raise Fail(f"{key}: session khác trên máy này đang review", BUSY)
+    if not ref_create(key, head_sha()):
+        local_unlock(key)
+        raise Fail(f"PR #{pr} đang được session khác review", BUSY)
+
+    led["state"] = "reviewing"
+    ledger_write(led, cid, f"review claim PR #{pr} bởi session {mine}… (vòng {led.get('review_rounds',0)+1})")
+    diff_stat = gh(["pr", "diff", str(pr), "-R", C.repo, "--name-only"], check=False).stdout.strip().splitlines()
+    out = {"pr": pr, "issue": issue, "round": led.get("review_rounds", 0) + 1,
+           "files": diff_stat, "base": BASE_BRANCH,
+           "sub_prs": led.get("sub_prs", {}), "key": key}
+    if a.json:
+        return emit(out, True)
+    print(f"đã giành review PR #{pr} (issue #{issue}), vòng {out['round']}, {len(diff_stat)} file")
+    return out
+
+
+REVIEW_HEADER = {
+    "pass": "## Review: ĐẠT\n\nKết luận: không có điểm chặn. Vào hàng đợi merge — "
+            "`tal merge` sẽ đi qua khi CI của PR này xanh.",
+    "changes": "## Review: YÊU CẦU SỬA\n\nCác điểm gắn `(blocking)` phải xử lý xong mới mở lại review.",
+}
+
+
+def cmd_review_verdict(a):
+    pr = a.pr
+    issue = pr_issue(pr)
+    led, cid, _ = ledger_read(issue)
+    verdict = "pass" if a.verdict == "pass" else "changes"
+    detail = Path(a.body_file).read_text() if a.body_file else (a.body or "")
+    if verdict == "changes" and not detail.strip():
+        raise Fail("verdict changes bắt buộc có nội dung: nêu rõ từng điểm theo Conventional Comments", 2)
+
+    round_no = led.get("review_rounds", 0) + (1 if verdict == "changes" else 0)
+    body = (
+        f"<!-- {REVIEW_MARKER} verdict={verdict} round={round_no} reviewer={session_id()[:8]} -->\n"
+        f"{REVIEW_HEADER[verdict]}\n\n{detail.strip()}\n\n"
+        "---\n<sub>Bình luận theo [Conventional Comments](https://conventionalcomments.org/): "
+        "`label (blocking|non-blocking): subject`. Chỉ `(blocking)` mới chặn merge.</sub>"
+    )
+    gh(["pr", "comment", str(pr), "-R", C.repo, "-b", body])
+
+    if verdict == "pass":
+        led["state"] = "review_passed"
+        led["review_rounds"] = led.get("review_rounds", 0)
+        ledger_write(led, cid, f"review ĐẠT PR #{pr} bởi {session_id()[:8]}… — vào hàng đợi merge")
+        for n in led.get("group", [issue]):
+            set_state_labels(n, {L_PASSED})
+        gh(["pr", "edit", str(pr), "-R", C.repo, "--add-label", L_PASSED], check=False)
+        print(f"PR #{pr} ĐẠT → #{issue} gắn {L_PASSED}. Merge bằng `tal merge {pr}` "
+              "khi CI của PR xanh — hai cổng đó cưỡng chế bằng máy, không cần người gật.")
+    else:
+        led["review_rounds"] = round_no
+        if round_no >= MAX_ATTEMPTS:
+            led["state"] = "dead_letter"
+            ledger_write(led, cid, f"review vòng {round_no} vẫn chưa đạt → dead-letter")
+            for n in led.get("group", [issue]):
+                set_state_labels(n, {L_DEAD, L_BLOCKED})
+            gh(["pr", "comment", str(pr), "-R", C.repo, "-b",
+                f"<!-- {REVIEW_MARKER}:dead-letter -->\n**Dừng vòng lặp tự động** — đã {round_no} vòng review "
+                f"chưa đạt (MAX_ATTEMPTS={MAX_ATTEMPTS}). Chuyển cho người."], check=False)
+            print(f"PR #{pr} sang dead-letter sau {round_no} vòng — cần người")
+        else:
+            led["state"] = "changes_requested"
+            ledger_write(led, cid, f"review yêu cầu sửa PR #{pr}, vòng {round_no}")
+            for n in led.get("group", [issue]):
+                set_state_labels(n, {L_CHANGES})
+            print(f"PR #{pr} CHƯA ĐẠT → #{issue} gắn {L_CHANGES} (ưu tiên cao nhất hàng đợi)")
+
+    ref_delete(f"pr-{pr}")
+    local_unlock(f"pr-{pr}")
+    return {"pr": pr, "issue": issue, "verdict": verdict, "round": round_no}
+
+
+def docs_rules() -> list[dict]:
+    """Bản đồ code→doc. Là CHÍNH SÁCH của repo nên nằm ở config, không nằm trong tool."""
+    return (CFG.get("docsRules") or [])
+
+
+def cmd_docs_check(a):
+    """PR này có cập nhật tài liệu mà nó đáng lẽ phải cập nhật chưa.
+
+    Là GỢI Ý cho người review, không phải rào chặn: có thay đổi thật sự không cần doc
+    (refactor nội bộ, đổi tên biến). Nhưng thiếu doc cho một thay đổi QUY ƯỚC hay HÀNH VI
+    thì reviewer phải chặn — vì cái mất không phải là văn bản, mà là người sau không còn
+    đường nào biết quy ước đã đổi."""
+    files = gh(["pr", "diff", str(a.pr), "-R", C.repo, "--name-only"], check=False).stdout.split()
+    if not files:
+        raise Fail(f"không đọc được danh sách file của PR #{a.pr}", 2)
+    md = [f for f in files if f.endswith(".md")]
+    code = [f for f in files if not f.endswith((".md", ".json", ".lock"))]
+
+    findings = []
+    for r in docs_rules():
+        pat, expect = r.get("when"), r.get("expect") or []
+        if not pat:
+            continue
+        hit = [f for f in files if re.search(pat, f)]
+        if not hit:
+            continue
+        done = [e for e in expect if e in files]
+        findings.append({
+            "rule": pat, "why": r.get("why", ""), "triggered_by": hit[:4],
+            "expect": expect, "updated": done, "gap": not done,
+        })
+
+    # Kiểm chung DUY NHẤT không cần bản đồ: đổi code mà không chạm .md nào.
+    # Mọi kiểm khác phải đến từ config — luật gắn cứng đường dẫn của một repo là
+    # phát biểu SAI ở mọi repo khác, và một phát biểu sai còn tệ hơn im lặng.
+    generic = []
+    if code and not md:
+        generic.append(f"PR đổi {len(code)} file code và KHÔNG chạm file .md nào")
+    for r in (CFG.get("docsGenericRules") or []):
+        pat, expect_prefix = r.get("when"), r.get("expectPrefix")
+        if not pat or not expect_prefix:
+            continue
+        if [f for f in files if re.search(pat, f)] and not any(
+                f.startswith(expect_prefix) for f in files):
+            generic.append(r.get("why") or f"chạm {pat} nhưng không chạm {expect_prefix}")
+
+    if a.json:
+        return emit({"pr": a.pr, "rules": findings, "generic": generic,
+                     "md_changed": md, "has_rules": bool(docs_rules())}, True)
+
+    if not docs_rules():
+        print("chưa khai `docsRules` trong config — chỉ chạy được kiểm chung")
+    gaps = [f for f in findings if f["gap"]]
+    for f in findings:
+        mark = "✘ THIẾU" if f["gap"] else "✔"
+        print(f"  {mark} {' , '.join(f['expect'])}")
+        print(f"      vì: {f['why']}")
+        print(f"      kích hoạt bởi: {', '.join(f['triggered_by'])}")
+    for g in generic:
+        print(f"  ! {g}")
+    if not findings and not generic:
+        print("không thấy khoảng trống tài liệu nào")
+    print(f"\nfile .md trong PR: {', '.join(md) if md else '(không có)'}")
+    return {"gaps": len(gaps), "generic": generic}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Merge — CHỈ khi review đã đạt VÀ CI xanh. Hai điều kiện, cưỡng chế bằng máy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def pr_checks(pr: int) -> tuple[str, list[str]]:
+    """→ (trạng thái tổng, chi tiết). Trạng thái: pass | pending | fail | none.
+
+    `skipping` không tính là chặn (job có điều kiện không chạy là bình thường), nhưng
+    `pending` thì CHẶN: merge khi CI chưa xong là đúng cái đã làm dev đỏ (#1147 ghi
+    lại một PR self-merge sau 9 phút với test của chính nó đang đỏ)."""
+    rows = gh_json(["pr", "checks", str(pr), "-R", C.repo, "--json", "name,bucket"], default=None)
+    if not rows:
+        return "none", []
+    detail = [f"{r.get('name')}={r.get('bucket')}" for r in rows]
+    buckets = {r.get("bucket") for r in rows}
+    if buckets & {"fail", "cancel"}:
+        return "fail", detail
+    if "pending" in buckets:
+        return "pending", detail
+    if "pass" in buckets:
+        return "pass", detail
+    return "none", detail
+
+
+def merge_blockers(pr: int) -> tuple[int | None, list[str]]:
+    """→ (issue neo, danh sách lý do KHÔNG merge được). Rỗng = đủ điều kiện.
+
+    Hai điều kiện, cưỡng chế bằng máy: review ĐẠT và CI của chính PR này XANH. CI ở đây
+    là test LIÊN QUAN (`affectedTests`), không phải full suite — full suite chạy một lần
+    ở PR vào mainBranch. Vì PR của một lô đã gộp 10–20 issue, "một lần CI cho một PR"
+    đã là một lần CI cho cả lô."""
+    why: list[str] = []
+    d = gh_json(["pr", "view", str(pr), "-R", C.repo, "--json",
+                 "isDraft,mergeable,state,headRefName,labels"], default=None)
+    if d is None:
+        return None, [f"không đọc được PR #{pr}"]
+    if d.get("state") != "OPEN":
+        why.append(f"PR không mở (state={d.get('state')})")
+    if d.get("isDraft"):
+        why.append("PR đang là draft")
+    if d.get("mergeable") == "CONFLICTING":
+        why.append("có conflict — phải merge dev vào nhánh rồi giải trước")
+
+    try:
+        issue = pr_issue(pr)
+    except Fail as e:
+        return None, why + [str(e)]
+
+    # Nhãn trên ISSUE là căn cứ duy nhất — nó là máy trạng thái, có ledger đi kèm.
+    # Nhãn trên PR chỉ để người nhìn cho nhanh, và nó SỐNG SÓT qua một lần push mới:
+    # một PR từng được pass, rồi bị sửa tiếp, vẫn còn nhãn pass trên PR. Hợp hai nguồn
+    # lại là tự mở cửa cho một bản chưa ai review đi qua rào này.
+    names = set(issue_data(issue)["labels"])
+    if L_PASSED and L_PASSED not in names:
+        why.append(f"chưa có nhãn {L_PASSED} — review PHẢI đạt trước")
+    if L_CHANGES in names:
+        why.append(f"đang mang {L_CHANGES} — vòng review yêu cầu sửa chưa xong")
+    if L_DEAD in names:
+        why.append(f"đang ở {L_DEAD} — cần người")
+
+    state, detail = pr_checks(pr)
+    if state == "fail":
+        why.append(f"CI ĐỎ: {' · '.join(detail)}")
+    elif state == "pending":
+        why.append(f"CI chưa xong: {' · '.join(detail)}")
+    elif state == "none":
+        why.append("không thấy CI nào — không có đối chứng để merge")
+    return issue, why
+
+
+def cmd_merge_queue(a):
+    prs = gh_json(["pr", "list", "-R", C.repo, "--state", "open", "--limit", "50",
+                   "--json", "number,title,headRefName,isDraft"], default=[])
+    out = []
+    for p in prs:
+        if p["isDraft"] or not TRACKED_HEAD.match(p["headRefName"]):
+            continue
+        issue, why = merge_blockers(p["number"])
+        out.append({"pr": p["number"], "issue": issue, "title": p["title"],
+                    "eligible": not why, "blockers": why})
+    if a.json:
+        return emit({"queue": out}, True)
+    ready = [x for x in out if x["eligible"]]
+    if not ready:
+        print("không có PR nào đủ điều kiện merge")
+    for x in ready:
+        print(f"PR #{x['pr']:<5} ← #{x['issue']}  {x['title'][:60]}")
+    if a.verbose:
+        print("\n-- chưa đủ điều kiện --")
+        for x in out:
+            if not x["eligible"]:
+                print(f"PR #{x['pr']}: {'; '.join(x['blockers'])}")
+    return out
+
+
+def cmd_merge(a):
+    pr = a.pr
+    issue, why = merge_blockers(pr)
+    if why and not a.force:
+        raise Fail("KHÔNG merge được PR #%d:\n  - %s\nLuật: review phải ĐẠT và CI phải XANH."
+                   % (pr, "\n  - ".join(why)), 2)
+    if why:
+        warn(f"--force: bỏ qua {len(why)} điều kiện — " + "; ".join(why))
+
+    # Xoá worktree TRƯỚC khi merge: `gh pr merge --delete-branch` không xoá được
+    # branch cục bộ đang bị một worktree giữ, và nó báo lỗi sau khi đã merge xong.
+    head = (gh_json(["pr", "view", str(pr), "-R", C.repo, "--json", "headRefName",
+                     "-q", ".headRefName"], default="") or "")
+    if head:
+        remove_worktree_branch(head)
+
+    p = gh(["pr", "merge", str(pr), "-R", C.repo, "--merge", "--delete-branch"], check=False)
+    blob = (p.stdout + p.stderr).strip()
+    if p.returncode != 0:
+        raise Fail(f"merge PR #{pr} thất bại:\n{blob}")
+
+    if issue:
+        led, cid, _ = ledger_read(issue)
+        led["state"] = "shipped"
+        led["lease"] = None
+        ledger_write(led, cid, f"merge PR #{pr} vào {BASE_BRANCH} (review đạt + CI xanh)")
+        for n in led.get("group", [issue]):
+            set_state_labels(n, {L_SHIPPED} if L_SHIPPED else set(), drop={L_READY})
+    print(f"đã merge PR #{pr} vào {BASE_BRANCH}" + (f", #{issue} → shipped" if issue else ""))
+    return {"pr": pr, "issue": issue}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GC — thu hồi lease chết + xoá sạch branch sau merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def reap_leases(dry: bool) -> list[dict]:
+    """Visibility-timeout expiry: lease im lặng quá TTL (theo đồng hồ server) thì thu hồi."""
+    done = []
+    for key in refs_all():
+        mi, mp = re.match(r"^issue-(\d+)$", key), re.match(r"^pr-(\d+)$", key)
+        if not (mi or mp):
+            done.append({"key": key, "action": "ref lạ, để nguyên (không phải lease của tal)"})
+            continue
+        if mp:
+            try:
+                issue = pr_issue(int(mp.group(1)))
+            except Fail:
+                done.append({"key": key, "action": "ref mồ côi (PR không còn) → xoá"})
+                if not dry:
+                    ref_delete(key)
+                    local_unlock(key)
+                continue
+        else:
+            issue = int(mi.group(1))
+
+        led, cid, upd = lease_clock(issue)
+        if upd is None:                     # có ref mà không có sổ = rác
+            done.append({"key": key, "issue": issue, "action": "ref mồ côi (không có ledger) → xoá"})
+            if not dry:
+                ref_delete(key)
+                local_unlock(key)
+            continue
+        if not lease_expired(led, upd):
+            continue
+
+        age = human_delta((now() - upd).total_seconds())
+        done.append({"key": key, "issue": issue, "action": f"thu hồi lease (im lặng {age})"})
+        if dry:
+            continue
+        ref_delete(key)
+        local_unlock(key)
+
+        if mp:                              # lease review chết → PR về lại hàng đợi review
+            ledger_write(led, cid, f"lease review {key} quá hạn (im lặng {age}) — trả PR về hàng đợi review")
+            set_state_labels(issue, {L_REVIEWING, L_AWAIT})
+            continue
+
+        led["reaps"] = led.get("reaps", 0) + 1
+        led["lease"] = None
+        led["batch"] = None
+        if led["reaps"] >= MAX_ATTEMPTS:
+            led["state"] = "dead_letter"
+            ledger_write(led, cid, f"thu hồi lần {led['reaps']} → dead-letter (session cứ chết giữa đường)")
+            set_state_labels(issue, {L_DEAD, L_BLOCKED})
+        else:
+            led["state"] = "queued"
+            ledger_write(led, cid, f"lease quá hạn, thu hồi (im lặng {age}) — trả về hàng đợi")
+            set_state_labels(issue, set())
+    return done
+
+
+def delete_merged_branches(repo: str, dry: bool, protect: set[str]) -> list[dict]:
+    """Xoá branch của MỌI PR đã merge — bot hay người mở đều dọn."""
+    acts = []
+    prs = gh_json(
+        ["pr", "list", "-R", repo, "--state", "merged", "--limit", "100",
+         "--json", "number,headRefName,headRepositoryOwner,mergedAt"],
+        default=[],
+    )
+    owner = repo.split("/")[0]
+    live_heads = {
+        r["ref"].split("refs/heads/")[-1]
+        for r in gh_json(["api", f"repos/{repo}/git/matching-refs/heads/", "--paginate"], default=[])
+    }
+    for p in prs:
+        br = p["headRefName"]
+        if br in protect or br not in live_heads:
+            continue
+        if (p.get("headRepositoryOwner") or {}).get("login") not in (owner, None):
+            continue  # fork — không phải của mình
+        acts.append({"repo": repo, "branch": br, "pr": p["number"], "action": "xoá branch remote (PR đã merge)"})
+        if not dry:
+            gh(["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{br}"], check=False)
+    return acts
+
+
+def cmd_gc(a):
+    dry = a.dry_run
+    acts: list[dict] = []
+    acts += reap_leases(dry)
+
+    protect = {"main", "dev", "master"}
+    acts += delete_merged_branches(C.repo, dry, protect)
+    if not a.no_submodules:
+        for s in submodules().values():
+            if s.get("repo"):
+                acts += delete_merged_branches(s["repo"], dry, protect | {sub_base(s)})
+
+    # worktree + branch cục bộ của issue đã xong
+    merged_prs = gh_json(
+        ["pr", "list", "-R", C.repo, "--state", "merged", "--limit", "100",
+         "--json", "number,headRefName,body,closingIssuesReferences"],
+        default=[],
+    )
+    for p in merged_prs:
+        head = p["headRefName"]
+        if not TRACKED_HEAD.match(head):
+            continue
+        nums = issues_from(head, p.get("body")) or [
+            int(x["number"]) for x in (p.get("closingIssuesReferences") or [])]
+        if not nums:
+            continue
+        issue = nums[0]                       # issue NEO: nơi giữ sổ của cả lô
+        wt = C.worktrees_dir / head
+        if not wt.exists() and not branch_exists_local(head):
+            continue
+        dirty = run(["git", "status", "--porcelain"], cwd=str(wt), check=False).stdout.strip() if wt.exists() else ""
+        if dirty:
+            acts.append({"issue": issue, "action": f"BỎ QUA worktree {head} — còn thay đổi chưa commit ({len(dirty.splitlines())} file)"})
+            continue
+        acts.append({"issue": issue, "action": f"xoá worktree + branch cục bộ {head} (PR đã merge)"})
+        if not dry:
+            remove_worktree_branch(head)
+            led, cid, _ = ledger_read(issue)
+            led["state"] = "shipped"
+            led["lease"] = None
+            ledger_write(led, cid, f"PR #{p['number']} đã merge → dọn worktree/branch")
+            for n in (led.get("group") or nums):
+                if issue_data(n)["state"] == "open":
+                    set_state_labels(n, {L_SHIPPED})
+                    if a.close:
+                        gh(["issue", "close", str(n), "-R", C.repo, "-c",
+                            f"Đã ship qua PR #{p['number']}."], check=False)
+
+    # PR đóng mà KHÔNG merge = việc bị bỏ. Xoá branch là mất code, nên chỉ báo,
+    # trừ khi người yêu cầu rõ bằng --include-abandoned.
+    for p in gh_json(["pr", "list", "-R", C.repo, "--state", "closed", "--limit", "100",
+                      "--json", "number,headRefName,body,mergedAt"], default=[]):
+        if p.get("mergedAt") or not TRACKED_HEAD.match(p["headRefName"]):
+            continue
+        nums = issues_from(p["headRefName"], p.get("body"))
+        issue = nums[0] if nums else 0
+        # Chỉ báo khi THẬT SỰ còn gì để dọn. Không kiểm thì mọi PR bị đóng sẽ được nhắc
+        # lại ở từng lượt gc, vĩnh viễn — và tiếng ồn lặp lại thì người đọc bắt đầu bỏ qua
+        # cả những dòng có thật.
+        leftover = ((C.worktrees_dir / p["headRefName"]).exists()
+                    or branch_exists_local(p["headRefName"])
+                    or branch_exists_remote(p["headRefName"]))
+        if not leftover:
+            continue
+        if a.include_abandoned:
+            acts.append({"issue": issue, "action": f"xoá branch + worktree (PR #{p['number']} đóng, KHÔNG merge)"})
+            if not dry:
+                remove_worktree_branch(p["headRefName"])
+                gh(["api", "-X", "DELETE", f"repos/{C.repo}/git/refs/heads/{p['headRefName']}"], check=False)
+        else:
+            acts.append({"issue": issue,
+                         "action": f"PR #{p['number']} đóng KHÔNG merge — còn branch/worktree; "
+                                   "dùng --include-abandoned nếu chắc là bỏ"})
+
+    # Worktree của lô mà mọi lease đã bị thu hồi: chỉ BÁO. Xoá là mất việc chưa commit,
+    # và lô nào bị thu hồi thì các issue của nó đã về lại hàng đợi rồi.
+    live_refs = set(refs_all())
+    for lfp in sorted(C.worktrees_dir.glob("batch-*/" + LEASE_FILE)):
+        try:
+            d = json.loads(lfp.read_text())
+        except Exception:
+            continue
+        if d.get("released"):
+            continue
+        if f"issue-{d.get('anchor', d.get('issue'))}" in live_refs:
+            continue
+        acts.append({"key": lfp.parent.name,
+                     "action": "worktree lô còn đây nhưng lease đã bị thu hồi — "
+                               "kiểm việc chưa commit rồi xoá bằng tay"})
+
+    if not dry:
+        run(["git", "worktree", "prune"], cwd=str(C.main_worktree), check=False)
+        run(["git", "fetch", "--prune", "-q", "origin"], cwd=str(C.main_worktree), check=False)
+        for d in C.state_dir.glob("*.lock"):
+            key = d.name[:-5]
+            if not ref_exists(key):
+                shutil.rmtree(d, ignore_errors=True)
+
+    if a.json:
+        return emit({"dry_run": dry, "actions": acts}, True)
+    if not acts:
+        print("không có gì để dọn")
+    for x in acts:
+        tag = "[dry] " if dry else ""
+        who = x.get("branch") or (f"#{x['issue']}" if x.get("issue") else x.get("key", ""))
+        print(f"{tag}{x.get('repo', C.repo)} {who}: {x['action']}")
+    return acts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# status / unlock / doctor
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def cmd_status(a):
+    rows = []
+    for key in refs_all():
+        m = re.match(r"^(issue|pr)-(\d+)$", key)
+        if not m:
+            rows.append({"key": key, "state": "ref lạ"})
+            continue
+        kind, num = m.group(1), int(m.group(2))
+        issue = num if kind == "issue" else pr_issue(num)
+        led, _, upd = lease_clock(issue)
+        lease = led.get("lease") or {}
+        left = ((upd + timedelta(seconds=lease.get("ttl", TTL))) - now()).total_seconds() if upd else -1
+        rows.append({
+            "key": key, "issue": issue, "state": led.get("state"),
+            "batch": led.get("batch"), "session": (lease.get("session") or "?")[:8],
+            "host": lease.get("host"), "epoch": led.get("epoch"),
+            "expires_in": human_delta(left), "expired": lease_expired(led, upd),
+        })
+    issues = open_issues()
+
+    def with_label(lb: str) -> list[int]:
+        return [i["number"] for i in issues if lb in {l["name"] for l in i["labels"]}]
+
+    board = {
+        "repo": C.repo, "me": session_id()[:8], "ttl": TTL, "leases": rows,
+        "ready": with_label(L_READY), "dead_letters": with_label(L_DEAD),
+        "awaiting_review": with_label(L_AWAIT), "awaiting_merge": with_label(L_PASSED),
+        "changes_requested": with_label(L_CHANGES),
+    }
+    if a.json:
+        return emit(board, True)
+    print(f"repo {C.repo} · session này {board['me']}… · TTL {human_delta(TTL)}\n")
+    print(f"{'key':<14}{'lô':<20}{'state':<18}{'session':<10}{'epoch':<7}còn")
+    for r in rows:
+        flag = "  ⟵ QUÁ HẠN, chạy tal gc" if r.get("expired") else ""
+        print(f"{r['key']:<14}{str(r.get('batch') or '(đơn)'):<20}{str(r.get('state','')):<18}"
+              f"{r.get('session',''):<10}{str(r.get('epoch','')):<7}{r.get('expires_in','')}{flag}")
+    if not rows:
+        print("(không có lease nào)")
+    print(f"\ncần sửa theo review (ưu tiên): {board['changes_requested']}"
+          f"\nchờ review: {board['awaiting_review']}"
+          f"\nchờ NGƯỜI merge: {board['awaiting_merge']}"
+          f"\ndead-letter (cần người): {board['dead_letters']}")
+    return board
+
+
+def cmd_unlock(a):
+    key = a.key if a.key.startswith(("issue-", "pr-")) else f"issue-{a.key}"
+    if not a.force:
+        raise Fail("cần --force: đây là can thiệp tay, chỉ dùng khi chắc session giữ lease đã chết", 2)
+    ref_delete(key)
+    local_unlock(key)
+    m = re.match(r"^issue-(\d+)$", key)
+    if m:
+        issue = int(m.group(1))
+        led, cid, _ = ledger_read(issue)
+        led["lease"] = None
+        led["state"] = "queued"
+        ledger_write(led, cid, f"mở khoá tay bởi {session_id()[:8]}… ({a.note or 'không nêu lý do'})")
+        set_state_labels(issue, set())
+    print(f"đã mở khoá {key}")
+
+
+def cmd_config(a):
+    """Skill gọi lệnh này để biết CHÍNH SÁCH của repo: base/main branch, cỡ lô, tên nhãn,
+    luật suy ra test liên quan, và các file policy phải đọc trước khi làm."""
+    out = {k: v for k, v in CFG.items()}
+    out["resolved"] = {"baseBranch": BASE_BRANCH, "ttlSeconds": TTL,
+                       "maxAttempts": MAX_ATTEMPTS, "refNamespace": REF_NS,
+                       "repo": C.repo, "session": session_id()[:8]}
+    if a.json:
+        return emit(out, True)
+    print(f"config: {CFG.get('_configPath') or '(không có — đang dùng mặc định)'}")
+    print(f"repo {C.repo} · base {BASE_BRANCH} → main {MAIN_BRANCH} · TTL {human_delta(TTL)} "
+          f"· tối đa {MAX_ATTEMPTS} vòng")
+    print(f"LÔ: {BATCH_MIN}–{BATCH_MAX} issue mỗi lô — một PR, MỘT lần review, MỘT lần CI")
+    print("\nnhãn:")
+    for k, v in CFG["labels"].items():
+        print(f"  {k:<18}{v or '(không dùng)'}")
+    docs = CFG.get("policyDocs") or {}
+    print("\nfile policy phải đọc:" if docs else "\nfile policy: (chưa khai — skill chỉ có luật chung)")
+    for k, v in docs.items():
+        mark = "" if (C.main_worktree / v).is_file() else "  ← KHÔNG TỒN TẠI"
+        print(f"  {k:<10}{v}{mark}")
+    at = CFG.get("affectedTests") or []
+    print(f"\ntest liên quan ({len(at)} luật — `tal tests` suy ra lệnh từ đây):"
+          if at else "\ntest liên quan: (chưa khai affectedTests — `tal tests` không suy ra được)")
+    for r in at:
+        print(f"  {r.get('when')}  →  {' ; '.join(r.get('run') or [])}")
+    fs = CFG.get("fullSuite") or []
+    print("\nfull suite — KHÔNG chạy trong vòng lặp, chỉ ở CI của PR vào "
+          f"{MAIN_BRANCH} hoặc `tal fullsuite`:" if fs else "\nfull suite: (chưa khai)")
+    for c in fs:
+        print(f"  $ {c}")
+    return out
+
+
+def cmd_doctor(a):
+    ok = True
+
+    def check(name: str, good: bool, detail: str = ""):
+        nonlocal ok
+        ok = ok and good
+        print(f"  {'✔' if good else '✘'} {name}{(' — ' + detail) if detail else ''}")
+
+    print("môi trường")
+    check("gh đã đăng nhập", gh(["auth", "status"], check=False).returncode == 0)
+    check("repo", True, C.repo)
+    check("session id", bool(os.environ.get("CLAUDE_CODE_SESSION_ID")),
+          session_id()[:16] + ("… (từ CLAUDE_CODE_SESSION_ID)" if os.environ.get("CLAUDE_CODE_SESSION_ID")
+                               else " — KHÔNG có CLAUDE_CODE_SESSION_ID, tách vai sẽ yếu"))
+    check(f"origin/{BASE_BRANCH}", branch_exists_remote(BASE_BRANCH))
+
+    print("\nprimitive CAS (điều kiện sống của khoá)")
+    probe = "doctor-probe"
+    ref_delete(probe)                       # dọn dư của lần chạy trước
+    created = ref_create(probe, head_sha())
+    twice = (not ref_create(probe, head_sha())) if created else True
+    if created:
+        ref_delete(probe)
+    check("tạo ref custom + lần 2 bị 422", created and twice,
+          "" if created and twice else "KHÔNG có khoá nguyên tử — dừng, đừng chạy nhiều session")
+
+    print("\nnhãn")
+    have = {l["name"] for l in gh_json(["label", "list", "-R", C.repo, "--limit", "200", "--json", "name"], default=[])}
+    for lb, (color, desc) in agent_labels().items():
+        if lb in have:
+            check(lb, True)
+        elif a.fix:
+            gh(["label", "create", lb, "-R", C.repo, "-c", color, "-d", desc], check=False)
+            check(lb, True, "đã tạo")
+        else:
+            check(lb, False, "thiếu — chạy `tal doctor --fix`")
+
+    print("\ndọn branch sau merge")
+    repos = [C.repo] + [s["repo"] for s in submodules().values() if s.get("repo")]
+    for r in repos:
+        cur = gh_json(["api", f"repos/{r}", "-q", ".delete_branch_on_merge"], default=None)
+        if cur is None:
+            check(f"{r}", False, "không đọc được (repo đổi tên?)")
+        elif cur:
+            check(f"{r} delete_branch_on_merge", True)
+        elif a.fix:
+            gh(["api", f"repos/{r}", "-X", "PATCH", "-F", "delete_branch_on_merge=true"], check=False)
+            check(f"{r} delete_branch_on_merge", True, "đã bật")
+        else:
+            check(f"{r} delete_branch_on_merge", False, "đang tắt — `tal doctor --fix`")
+
+    print("\nchính sách của repo (plugin không mang sẵn)")
+    check(f"{CONFIG_FILE}", CFG.get("_configPath") is not None,
+          CFG.get("_configPath") or "chưa có — đang chạy mặc định; xem examples/agent-loop.json")
+    docs = CFG.get("policyDocs") or {}
+    if not docs:
+        check("policyDocs", False, "chưa khai — skill sẽ chỉ có luật chung, không biết quy ước repo")
+    for k, v in docs.items():
+        check(f"policyDocs.{k}", (C.main_worktree / v).is_file(), v)
+    check("affectedTests (test liên quan — thứ DUY NHẤT vòng lặp chạy)",
+          bool(CFG.get("affectedTests")),
+          f"{len(CFG.get('affectedTests') or [])} luật"
+          if CFG.get("affectedTests") else "chưa khai — `tal tests` không suy ra được lệnh nào")
+    check(f"fullSuite (chỉ cho CI của PR vào {MAIN_BRANCH} / `tal fullsuite`)",
+          bool(CFG.get("fullSuite")),
+          " · ".join(CFG.get("fullSuite") or []) or "chưa khai")
+    check(f"origin/{MAIN_BRANCH}", branch_exists_remote(MAIN_BRANCH),
+          "" if branch_exists_remote(MAIN_BRANCH) else "không thấy — khai `mainBranch` cho đúng")
+    check(f"{BATCH_MIN}–{BATCH_MAX} issue mỗi lô", BATCH_MIN >= 2,
+          f"min={BATCH_MIN} max={BATCH_MAX}"
+          + ("" if BATCH_MIN >= 2 else "  ← lô 1 issue là quay lại đúng cái đang phải chữa"))
+
+    print("\ngitignore")
+    gi = (C.main_worktree / ".gitignore").read_text() if (C.main_worktree / ".gitignore").exists() else ""
+    for pat in (".claude/worktrees/", LEASE_FILE):
+        check(f"bỏ qua {pat}", pat in gi, "" if pat in gi else "thêm vào .gitignore")
+
+    print("\n" + ("mọi thứ ổn" if ok else "còn hạng mục chưa đạt — xem dấu ✘"))
+    return 0 if ok else 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# hook PreToolUse — rào cứng: không ai ghi vào worktree của issue mình không giữ
+# ─────────────────────────────────────────────────────────────────────────────
+
+WRITE_TOOLS = {"Edit", "Write", "NotebookEdit"}
+PUSH_RE = re.compile(r"\bgit\s+push\b|\bgh\s+pr\s+create\b")
+
+
+def danger_re() -> re.Pattern:
+    """Push thẳng vào base/main. Phải dựng SAU load_config: tên nhánh gắn cứng ở đây là
+    rào không đóng ở mọi repo đặt tên khác — và một rào im lặng không đóng thì tệ hơn
+    không có rào."""
+    names = "|".join(re.escape(x) for x in {BASE_BRANCH, MAIN_BRANCH} if x)
+    return re.compile(rf"\bgit\s+push\b.*\b(origin\s+)?({names})\b")
+# Mọi cách tạo branch — chặn ngay từ dòng lệnh, kể cả trong submodule (`git -C sub …`).
+NEWBRANCH_RE = [
+    re.compile(r"\bgit\s+(?:-C\s+\S+\s+)*(?:checkout|switch)\s+(?:-b|-B|-c|-C)\s+(\S+)"),
+    re.compile(r"\bgit\s+(?:-C\s+\S+\s+)*branch\s+(?!-[dDmMrlva]|--)(\S+)"),
+    re.compile(r"\bgit\s+(?:-C\s+\S+\s+)*worktree\s+add\s+(?:.*?\s)?-[bB]\s+(\S+)"),
+    re.compile(r"\bgit\s+(?:-C\s+\S+\s+)*push\s+\S+\s+\S+:(?:refs/heads/)?(\S+)"),
+]
+
+
+def cmd_hook_guard(a):
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+    tool = payload.get("tool_name", "")
+    ti = payload.get("tool_input", {}) or {}
+    sid = payload.get("session_id") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+
+    target = ti.get("file_path") or ti.get("notebook_path") or cwd
+    if tool == "Bash":
+        target = cwd
+
+    try:
+        # search=False: hook chỉ xét chính đường dẫn bị ghi. Không được suy diễn sang
+        # worktree khác, kẻo chặn oan mọi thao tác ngoài worktree.
+        wt, lf = lease_file(
+            Path(target if Path(target).is_dir() else str(Path(target).parent)), search=False
+        )
+    except Exception:
+        sys.exit(0)                       # ngoài worktree của issue → không can thiệp
+
+    def deny(reason: str):
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }))
+        sys.exit(0)
+
+    who = (f"lô {lf['batch']} ({len(lf.get('issues', []))} issue)"
+           if lf.get("kind") == "batch" else f"issue #{lf['issue']}")
+
+    if lf.get("released"):
+        deny(
+            f"[tal] Worktree này thuộc {who} nhưng lease ĐÃ NHẢ "
+            f"({lf.get('released_at','?')}) — nó được giữ lại chỉ để dùng cho vòng sửa sau. "
+            f"Muốn ghi thì nhận lại lease trước (`tal batch claim --issues …` hoặc "
+            f"`tal claim {lf['issue']}`). Đừng sửa trong một worktree "
+            "không ai đang giữ: không có gì bảo đảm bạn không đang đè lên việc của người khác."
+        )
+
+    if sid and lf.get("session") and sid != lf["session"]:
+        deny(
+            f"[tal] Worktree này thuộc {who}, do session {lf['session'][:8]}… giữ lease. "
+            f"Session của bạn ({sid[:8]}…) KHÔNG được sửa ở đây. Chạy `tal batch claim` lấy "
+            "lô của riêng mình, hoặc `tal status` xem ai đang giữ."
+        )
+
+    if tool == "Bash":
+        cmdline = ti.get("command", "")
+
+        # FULL SUITE BỊ CẤM TRONG VÒNG LẶP — rào cứng, không phải lời khuyên.
+        # Nó chạy ở CI của PR vào main, hoặc khi người gõ `tal fullsuite` từ gốc repo.
+        # Chạy nó ở đây là trả hàng chục phút cho một câu hỏi mà CI trả lời đúng hơn.
+        for fs in (CFG.get("fullSuite") or []):
+            if fs.strip() and fs.strip() in cmdline:
+                deny(
+                    f"[tal] Full suite BỊ CẤM trong worktree của vòng lặp:\n    {fs.strip()}\n"
+                    "Vòng lặp chỉ chạy TEST LIÊN QUAN: `tal tests` (xem lệnh) / "
+                    "`tal tests --run` (chạy). Full suite chạy MỘT lần ở CI của PR vào "
+                    f"`{MAIN_BRANCH}` (`tal release-to-main`), hoặc do người gõ `tal fullsuite` "
+                    "từ gốc repo."
+                )
+
+        for rx in NEWBRANCH_RE:
+            for name in rx.findall(cmdline):
+                nm = name.strip("'\"")
+                if not (BRANCH_RE.match(nm) or BATCH_RE.match(nm)):
+                    deny(
+                        f"[tal] Cấm đặt tên branch {nm!r}. Chỉ có hai dạng: `issue-<số>` cho "
+                        "issue đơn (bắt buộc khi chạm submodule) và `batch-<YYYYMMDD-HHMM>` "
+                        "cho một lô — `tal batch claim` và `tal submodule <path>` tự đặt đúng "
+                        f"tên. Đang làm: {who}."
+                    )
+        if danger_re().search(cmdline):
+            deny(f"[tal] Không push thẳng vào {BASE_BRANCH}/{MAIN_BRANCH} từ worktree của {who}. "
+                 f"Dùng `tal pr` để mở PR vào {BASE_BRANCH}.")
+        if PUSH_RE.search(cmdline):
+            try:
+                do_assert(quiet=True)
+            except Fail as e:
+                deny(f"[tal] Chặn ghi ra remote: {e}")
+    sys.exit(0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="tal", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub_ = ap.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help_):
+        p = sub_.add_parser(name, help=help_)
+        p.set_defaults(fn=fn)
+        p.add_argument("--json", action="store_true", help="in JSON")
+        return p
+
+    p = add("doctor", cmd_doctor, "kiểm tra điều kiện chạy")
+    p.add_argument("--fix", action="store_true", help="tạo nhãn thiếu, bật delete_branch_on_merge")
+
+    add("config", cmd_config, "in chính sách đã giải của repo (skill đọc lệnh này)")
+
+    p = add("queue", cmd_queue, "hàng đợi issue cho vai code")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("-v", "--verbose", action="store_true", help="kèm lý do bỏ qua")
+
+    # ── LÔ: đường chính. `claim` một-issue giờ chỉ dành cho ca chạm submodule. ──
+    bp = sub_.add_parser("batch", help="LÔ 10–20 issue: một PR, MỘT review, MỘT lần CI")
+    bsub = bp.add_subparsers(dest="batch_cmd", required=True)
+
+    def badd(name, fn, help_):
+        q = bsub.add_parser(name, help=help_)
+        q.set_defaults(fn=fn)
+        q.add_argument("--json", action="store_true", help="in JSON")
+        return q
+
+    q = badd("claim", cmd_batch_claim, "giành 10–20 issue + dựng MỘT worktree cho cả lô")
+    q.add_argument("--size", type=int, help=f"số issue tối đa (mặc định {BATCH_MAX})")
+    q.add_argument("--min", type=int, help=f"tối thiểu, dưới mức này thì không lập lô (mặc định {BATCH_MIN})")
+    q.add_argument("--issues", help="chỉ định tay: 12,15,20 (bỏ qua hàng đợi)")
+    q.add_argument("--force", action="store_true", help="lập lô dù chưa đủ --min")
+
+    badd("status", cmd_batch_status, "lô hiện tại: issue nào đã có commit, commit nào lạc")
+
+    q = badd("drop", cmd_batch_drop, "gỡ MỘT issue khỏi lô: revert commit + trả về hàng đợi")
+    q.add_argument("issue", type=int)
+    q.add_argument("--reason", help="vì sao gỡ — vào sổ và vào comment PR")
+    q.add_argument("--blocked", action="store_true", help="đánh dấu blocked thay vì trả về hàng đợi")
+    q.add_argument("--keep-commits", action="store_true",
+                   help="không revert (chỉ khi đã tự gỡ bằng tay)")
+
+    p = add("tests", cmd_tests, "TEST LIÊN QUAN theo affectedTests — thứ duy nhất vòng lặp được chạy")
+    p.add_argument("--run", action="store_true", help="chạy luôn, không chỉ in lệnh")
+    p.add_argument("--pr", type=int, help="suy ra từ diff của một PR thay vì worktree")
+
+    p = add("fullsuite", cmd_fullsuite, f"full suite — NGƯỜI gõ, hoặc CI của PR vào {MAIN_BRANCH}")
+    p.add_argument("--force", action="store_true", help="chạy cả khi đang trong worktree vòng lặp")
+
+    p = add("release-to-main", cmd_release_to_main,
+            f"mở PR {BASE_BRANCH} → {MAIN_BRANCH} — ĐÂY là nơi full suite chạy, trong CI")
+    p.add_argument("--title")
+    p.add_argument("--body-file")
+
+    p = add("claim", cmd_claim, "giành MỘT issue (đường của ca chạm submodule)")
+    p.add_argument("issue", type=int)
+    p.add_argument("--force", action="store_true", help="bỏ qua cổng agent:ready / dead-letter")
+    p.add_argument("--force-root", action="store_true", help="không cảnh báo khi leo lên parent")
+    p.add_argument("--split", action="store_true",
+                   help="cho sub-issue này branch riêng issue-<số của nó> thay vì làm chung với parent")
+
+    add("renew", cmd_renew, "gia hạn lease (heartbeat) — gọi sau mỗi bước dài")
+    add("assert", cmd_assert, "fencing check: còn quyền ghi hay không")
+
+    p = add("release", cmd_release, "nhả lease")
+    p.add_argument("--state", choices=["review", "blocked", "abandon", "no-op", "shipped"],
+                   required=True,
+                   help="no-op = đã kiểm, không có việc → tháo nhãn cổng, không nhặt lại")
+    p.add_argument("--issue", type=int)
+    p.add_argument("--note")
+
+    p = add("pr", cmd_pr, "push + mở/cập nhật PR vào base + bàn giao review")
+    p.add_argument("--title")
+    p.add_argument("--body")
+    p.add_argument("--body-file")
+    p.add_argument("--allow-dirty", action="store_true")
+    p.add_argument("--skip-submodule-check", action="store_true",
+                   help="bỏ cổng kiểm pointer submodule (chỉ khi người yêu cầu)")
+    p.add_argument("--allow-orphan-commits", action="store_true",
+                   help="(lô) cho phép commit không map được về một issue — mất khả năng drop")
+    p.add_argument("--allow-empty-issues", action="store_true",
+                   help="(lô) cho phép issue không có commit nào")
+
+    add("submodule-check", cmd_submodule_check, "soi pointer/branch/PR của mọi submodule đã chạm")
+
+    p = add("submodule", cmd_submodule, "init submodule trong worktree + tạo branch issue-N")
+    p.add_argument("path")
+
+    p = add("submodule-pr", cmd_submodule_pr, "push + mở PR trong repo con (base = .gitmodules branch)")
+    p.add_argument("path")
+    p.add_argument("--title")
+    p.add_argument("--body-file")
+
+    add("review-queue", cmd_review_queue, "PR đang chờ review")
+
+    p = add("review-claim", cmd_review_claim, "giành quyền review một PR")
+    p.add_argument("pr", type=int)
+    p.add_argument("--allow-self", action="store_true", help="bỏ rào tách vai (cần người yêu cầu)")
+
+    p = add("review-verdict", cmd_review_verdict, "kết luận review: pass | changes")
+    p.add_argument("pr", type=int)
+    p.add_argument("verdict", choices=["pass", "changes"])
+    p.add_argument("--body")
+    p.add_argument("--body-file")
+
+    p = add("docs-check", cmd_docs_check, "PR có cập nhật tài liệu đáng lẽ phải cập nhật chưa")
+    p.add_argument("pr", type=int)
+
+    p = add("merge-queue", cmd_merge_queue, "PR đủ điều kiện merge (review đạt + CI xanh)")
+    p.add_argument("-v", "--verbose", action="store_true", help="kèm lý do chưa đủ điều kiện")
+
+    p = add("merge", cmd_merge, "merge MỘT PR — đòi review đạt và CI (test liên quan) xanh")
+    p.add_argument("pr", type=int)
+    p.add_argument("--force", action="store_true",
+                   help="bỏ qua điều kiện (chỉ khi người yêu cầu rõ)")
+
+    p = add("gc", cmd_gc, "thu hồi lease chết + xoá branch/worktree sau merge")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-submodules", action="store_true")
+    p.add_argument("--close", action="store_true", help="đóng luôn issue đã ship")
+    p.add_argument("--include-abandoned", action="store_true",
+                   help="xoá cả branch/worktree của PR đóng mà không merge (mất code, cân nhắc)")
+
+    add("status", cmd_status, "bảng điều phối")
+
+    p = add("unlock", cmd_unlock, "mở khoá tay (chỉ khi session giữ lease đã chết)")
+    p.add_argument("key")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--note")
+
+    add("hook-guard", cmd_hook_guard, "(nội bộ) hook PreToolUse")
+
+    a = ap.parse_args()
+    try:
+        load_config()
+        r = a.fn(a)
+        return r if isinstance(r, int) else 0
+    except Fail as e:
+        print(f"[tal] {e}", file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

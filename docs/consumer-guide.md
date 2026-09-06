@@ -1,0 +1,423 @@
+# Hướng dẫn cho repo dùng agent-loop
+
+Dành cho người dựng vòng lặp trong **repo của bạn**. Plugin mang **cơ chế**; repo mang
+**chính sách**. Không khai chính sách thì vòng lặp chạy được nhưng mù — nó không biết repo
+bạn chạy test thế nào, quy ước gì, đã cháy ở đâu.
+
+Đọc `README.md` trước để hiểu *vì sao* mô hình là lô. File này là *làm thế nào*.
+
+---
+
+## 0. Điều kiện
+
+| Cần | Vì sao |
+|---|---|
+| `git`, `gh` đã `gh auth login`, `python3` (stdlib) | tal không dùng `jq`, không dùng `flock` |
+| Repo trên GitHub, có `baseBranch` (vd `dev`) và `mainBranch` (vd `main`) | lô vào base; full suite ở PR base→main |
+| GitHub Issues bật | ledger sống trong comment của issue |
+| CI chạy được trên PR | `tal merge` đòi CI của chính PR đó xanh |
+
+Quyền `gh` phải tạo được ref tuỳ ý (`POST /git/refs`). `tal doctor` kiểm điều này bằng một
+ref thử — nếu nó đỏ thì **đừng chạy nhiều session**, khoá không có hiệu lực.
+
+---
+
+## 1. Cài
+
+```sh
+/plugin marketplace add godx-jp/claude-agent-loop
+/plugin install agent-loop@godx
+/reload-plugins
+```
+
+Trong repo:
+
+```sh
+cp <plugin>/examples/agent-loop.json .claude/agent-loop.json
+$EDITOR .claude/agent-loop.json          # bước 2
+printf '.claude/worktrees/\n.tal-lease.json\n' >> .gitignore
+tal doctor --fix                          # tạo nhãn agent:*, bật delete_branch_on_merge
+tal config                                # đọc lại chính sách đã giải
+```
+
+`.claude/agent-loop.json` **phải commit** — nó là chính sách chung của cả đội, không phải
+cấu hình máy cá nhân.
+
+---
+
+## 2. `.claude/agent-loop.json` — từng khoá
+
+### Bắt buộc trên thực tế
+
+| Khoá | Không khai thì sao |
+|---|---|
+| `baseBranch` | mặc định `"dev"`. Sai là mọi PR nhắm sai nhánh |
+| `mainBranch` | mặc định `"main"`. `tal release-to-main` mở PR vào đây |
+| **`affectedTests`** | **`tal tests` không suy ra được lệnh nào — vai code mất hẳn cách chạy test đúng phạm vi.** Đây là khoá quan trọng nhất |
+| `fullSuite` | `tal fullsuite` không chạy được, và **`hook-guard` không có gì để chặn** — full suite lọt vào vòng lặp |
+| `policyDocs` | skill chỉ có luật chung, không biết quy ước repo |
+
+### `affectedTests` — viết cho đúng
+
+Đây là [Test Impact Analysis](https://dora.dev/capabilities/test-automation/): đường dẫn
+nào đổi thì chạy lệnh test nào. Cấu trúc:
+
+```json
+"affectedTests": [
+  {
+    "when": "<regex khớp đường dẫn file>",
+    "run": ["<lệnh>", "<lệnh>"],
+    "why": "<vì sao — cho người đọc, tal không dùng>"
+  }
+]
+```
+
+Cách tal dùng: lấy `git diff --name-only origin/<base>...HEAD` cộng file chưa commit, chạy
+từng `when` lên danh sách đó, gộp mọi `run` khớp được (bỏ trùng, giữ thứ tự), rồi in ra
+hoặc chạy với `--run`.
+
+**Ba luật khi viết:**
+
+1. **Lệnh phải HẸP.** Theo filter, theo thư mục, theo package — không bao giờ là toàn bộ
+   suite. Nếu một luật của bạn chạy hết mọi test thì bạn vừa đưa full suite trở lại vòng
+   lặp bằng cửa sau.
+2. **Đi từ hẹp đến rộng.** Luật `^lang/` (chỉ chuỗi hiển thị) nên chạy ít hơn hẳn luật
+   `^backend/app/`. Một sửa text chỉ nên kích hoạt đúng một lệnh nhanh.
+3. **Có ít nhất một luật bắt trọn.** Ví dụ `\\.tsx?$` → `typecheck`. Đường dẫn không khớp
+   luật nào thì `tal tests` in "không có test liên quan" và vai code sẽ ship mà không chạy
+   gì — đôi khi đúng (đổi ảnh, đổi README), nhưng phải là quyết định của bạn chứ không
+   phải khoảng trống.
+
+Ví dụ thật (Laravel + React):
+
+```json
+"affectedTests": [
+  { "when": "^lang/|^resources/js/locales/",
+    "run": ["pnpm test -- --run i18n"],
+    "why": "chuỗi hiển thị: một lệnh nhanh là đủ" },
+
+  { "when": "^backend/app/Billing/|^backend/app/Payments/",
+    "run": ["cd backend && vendor/bin/pest --compact --filter='Billing|Payment'"],
+    "why": "tiền: chạy trọn nhóm test của tầng, không chỉ file bị sửa" },
+
+  { "when": "^backend/app/",
+    "run": ["cd backend && vendor/bin/pest --compact --group=unit"],
+    "why": "code PHP nói chung" },
+
+  { "when": "^backend/database/migrations/",
+    "run": ["cd backend && vendor/bin/pest --compact --group=migration"],
+    "why": "DDL phải chạy trên engine thật, không chỉ SQLite" },
+
+  { "when": "\\.tsx?$",
+    "run": ["pnpm typecheck"],
+    "why": "rào rẻ nhất cho mọi thay đổi TS" }
+]
+```
+
+Kiểm luật bạn vừa viết, không đoán:
+
+```sh
+tal tests --pr 123          # in đúng những lệnh sẽ chạy cho diff của PR 123
+```
+
+### `fullSuite` — và vì sao khai nó lại là để CẤM nó
+
+```json
+"fullSuite": [
+  "cd backend && php -d memory_limit=-1 vendor/bin/pest --compact",
+  "pnpm typecheck"
+]
+```
+
+**Bẫy phải tránh khi khai — phát hiện lúc dựng config thật cho godx-task:**
+
+> `hook-guard` so khớp **substring**. Nếu bạn khai `fullSuite: ["php artisan test --compact"]`
+> thì mọi lệnh trong `affectedTests` có chứa chuỗi đó — kể cả
+> `php artisan test --compact --testsuite=Unit` — **đều bị chặn**. Vòng lặp mất luôn cách
+> chạy test hẹp, tức là bạn vừa khoá chính cái đường thoát mà mô hình này dựa vào.
+>
+> Khai **script "chạy tất" của repo** thay vì lệnh chạy test trần: `composer ci:check`,
+> `make ci`, `pnpm test:all`. Chúng không phải tiền tố của lệnh hẹp nào.
+>
+> Kiểm bằng máy, đừng đọc bằng mắt:
+>
+> ```sh
+> python3 - <<'EOF'
+> import json; d=json.load(open('.claude/agent-loop.json'))
+> aff=[c for r in d['affectedTests'] for c in r['run']]
+> bad=[(f,c) for f in d['fullSuite'] for c in aff if f in c]
+> print("ĐỤNG:",bad) if bad else print(f"OK — {len(aff)} lệnh affectedTests không bị chặn nhầm")
+> EOF
+> ```
+
+Khai xong, ba thứ xảy ra:
+
+1. `tal fullsuite` chạy được (từ gốc repo, không phải trong worktree).
+2. `tal release-to-main` nhắc rằng đây là nơi chúng chạy trong CI.
+3. **`hook-guard` chặn đúng những chuỗi này** nếu agent gõ chúng trong worktree của vòng
+   lặp. So khớp là **substring trên chuỗi bạn khai** — nên khai đúng lệnh thật, đừng khai
+   một biến thể gần đúng, kẻo rào không đóng.
+
+Kiểm rào:
+
+```sh
+cd .claude/worktrees/batch-*        # bất kỳ worktree nào của lô
+# rồi bảo agent chạy full suite — nó phải bị deny với thông điệp của tal
+```
+
+### `batch`
+
+```json
+"batch": { "min": 10, "max": 20 }
+```
+
+`min` là số issue tối thiểu để lập lô. Dưới mức đó `tal batch claim` trả **exit 75** và
+không lập lô — cố ý: lô nhỏ là quay lại đúng cái đang phải chữa. Backlog thưa thì hoặc gắn
+thêm nhãn `ready`, hoặc chạy `tal batch claim --min 5` khi bạn chấp nhận.
+
+Đừng đặt `max` quá lớn. Trần thật không phải kỹ thuật mà là **review**: một PR mà session
+review không đọc nổi trong một lượt thì review thành đóng dấu. 20 là mức đã cân; hơn nữa
+thì tự đo trước.
+
+### `policyDocs`
+
+Ba file trong repo, skill **bắt buộc** đọc:
+
+| Khoá | Đặt gì vào |
+|---|---|
+| `work` | thứ tự lệnh bắt buộc, codegen, cạm bẫy đã biết, thư mục nào không được đụng |
+| `test` | cách chạy test theo vùng bằng lời (bổ sung cho `affectedTests`), test nào chậm, test nào cần service ngoài |
+| `review` | checklist riêng: chỗ đã từng cháy, quy ước bắt buộc, luật domain (tiền, thời gian, quyền) |
+
+Không có chúng, skill vẫn chạy nhưng chỉ có luật chung — và **nói ra rằng nó đang thiếu**.
+
+### `labels`
+
+Bốn nhãn đầu (`working` / `reviewing` / `blocked` / `shipped`) khai **đúng tên repo bạn
+đang dùng**, để bảng issue không bị chẻ làm hai hệ. Không dùng thì để `""`. Năm nhãn
+`agent:*` do plugin sở hữu, `tal doctor --fix` tự tạo.
+
+### `docsRules` / `docsGenericRules`
+
+`tal docs-check <PR>` là **gợi ý cho reviewer**, không phải rào.
+
+```json
+"docsRules": [
+  { "when": "BusinessClock|business_day", "expect": ["docs/guide/business-time.md"],
+    "why": "thời gian nghiệp vụ theo timezone chi nhánh" }
+],
+"docsGenericRules": [
+  { "when": "^backend/routes/|Controllers/", "expectPrefix": "backend/storage/api-docs/",
+    "why": "chạm route/controller nhưng không regen tài liệu API" }
+]
+```
+
+Lấy `docsRules` từ chính những dòng "Tracked in `<doc>`" mà tài liệu repo tự tuyên bố —
+đừng tự nghĩ ra. `docsGenericRules` mặc định **rỗng**: một luật gắn cứng đường dẫn của repo
+khác là phát biểu sai ở repo bạn, và một phát biểu sai còn tệ hơn im lặng.
+
+---
+
+## 3. CI — hai workflow, không hơn
+
+Đây là phần plugin **không** mang hộ được, và thiếu nó thì `tal merge` sẽ chặn với lý do
+"không thấy CI nào — không có đối chứng để merge".
+
+### A. PR vào base: chỉ test liên quan
+
+`.github/workflows/pr-affected.yml`
+
+```yaml
+name: PR checks
+on:
+  pull_request:
+    branches: [dev]          # = baseBranch
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  affected:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }         # tal cần lịch sử để diff với base
+
+      - uses: actions/checkout@v4        # một nguồn sự thật cho tal, không vendor bản sao
+        with:
+          repository: godx-jp/claude-agent-loop
+          path: .agent-loop
+
+      # ... setup ngôn ngữ + cài dependency của repo bạn ...
+
+      - name: Test liên quan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .agent-loop/bin/tal tests --pr ${{ github.event.pull_request.number }} --run
+```
+
+Một job, một tên check. `tal merge` đọc `gh pr checks` và chặn khi **fail** hoặc
+**pending** — nên đừng để job nào treo vô hạn.
+
+### B. PR vào main: full suite, một lần mỗi chu kỳ release
+
+`.github/workflows/release-full-suite.yml`
+
+```yaml
+name: Full suite
+on:
+  pull_request:
+    branches: [main]         # = mainBranch
+  workflow_dispatch:
+
+jobs:
+  full-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: godx-jp/claude-agent-loop
+          path: .agent-loop
+
+      # ... setup + dependency + service (DB thật, không SQLite) ...
+
+      - name: Full suite
+        run: python3 .agent-loop/bin/tal fullsuite
+```
+
+`tal fullsuite` từ chối chạy khi cwd nằm trong `.claude/worktrees/` — trong CI thì không
+nên có, nên nó chạy bình thường. Đây là **nơi duy nhất** full suite chạy tự động.
+
+### Branch protection
+
+| Nhánh | Bật gì |
+|---|---|
+| `dev` (base) | required status check = job của workflow A · cấm push thẳng |
+| `main` | required status check = job của workflow B · cấm push thẳng · yêu cầu người duyệt |
+
+`hook-guard` đã chặn agent push thẳng vào base/main, nhưng branch protection là tầng chặn
+duy nhất không phụ thuộc việc agent có chạy qua hook hay không.
+
+---
+
+## 4. Chạy hằng ngày
+
+Mở cổng cho bot bằng nhãn `agent:ready` trên issue. Không có nhãn đó thì bot bỏ qua — để
+không session nào hồn nhiên bắt tay vào một epic kiến trúc.
+
+Hai session Claude Code **khác nhau**:
+
+```
+/loop /agent-loop:batch-work       # session code
+/loop /agent-loop:batch-review     # session review
+```
+
+Tách vai dựa trên `CLAUDE_CODE_SESSION_ID`. Thiếu biến đó thì rào "review phải khác session
+code" rơi về `shell-<host>-<ppid>` và yếu đi — `tal doctor` cảnh báo.
+
+Một lượt code trông như:
+
+```
+tal gc → tal batch claim  →  12 issue, worktree .claude/worktrees/batch-20260906-1430
+  với mỗi issue: đọc comment + kiểm origin → sửa → commit "fix(scope): … (#1234)"
+tal batch status  →  issue nào chưa có commit, commit nào lạc
+tal tests --run   →  4 lệnh test liên quan, xanh
+tal pr            →  1 PR, Closes #… × 12, nhả lease
+```
+
+Một lượt review:
+
+```
+tal gc → tal review-queue → tal review-claim <PR>
+đọc diff theo từng issue → tal tests --pr <PR> → tal review-verdict <PR> pass
+tal merge <PR>            # review đạt + CI xanh, hai cổng cưỡng chế bằng máy
+```
+
+Khi base tích đủ, mở cổng ra production:
+
+```sh
+tal release-to-main       # PR dev→main; full suite chạy ở CI của PR này
+```
+
+---
+
+## 5. Hai ca đặc biệt
+
+### Issue chạm submodule
+
+**Không đi đường lô.** Pointer submodule là sha trơ, nên nhánh chạm nó phải mang số issue
+trong tên — mà tên lô thì không mang được. `tal pr` chặn lô chạm submodule.
+
+```sh
+tal batch drop <N> --reason "chạm submodule"
+tal claim <N>             # branch issue-<N>
+```
+
+rồi làm theo skill `issue-submodule`.
+
+### Một issue làm hỏng cả lô
+
+```sh
+tal batch drop <N> --reason "test đỏ, chưa gỡ được"          # trả về hàng đợi
+tal batch drop <N> --blocked --reason "chờ ops mở port"      # đánh dấu blocked
+```
+
+Nó revert đúng những commit mang `(#N)`, gỡ `Closes #N` khỏi thân PR, và 11 issue kia đi
+tiếp. Đây là lý do luật "mỗi commit mang `(#N)`" là **rào cứng** chứ không phải quy ước:
+`tal pr` từ chối mở PR nếu còn commit không map được về đúng một issue.
+
+---
+
+## 6. Đọc lỗi
+
+| Exit | Nghĩa | Làm gì |
+|---|---|---|
+| `75` | **không phải lỗi** — người khác đang giữ, hoặc chưa đủ `min` issue | nói rõ, kết thúc lượt |
+| `5` | PR do chính session này code | chọn PR khác, **đừng** `--allow-self` |
+| `4` | fencing: hết lease / mất lease / epoch lệch / quá hạn | **DỪNG mọi thao tác ghi**, đừng push |
+| `3` | không tìm thấy thẻ lease, hoặc session giữ nhiều worktree | `cd` vào đúng worktree |
+| `2` | vi phạm chính sách (commit lạc, issue rỗng, lô chạm submodule, thiếu config) | sửa đúng thứ nó nêu; **đừng** dùng cờ `--allow-*` để lách |
+
+Tình huống hay gặp:
+
+| Triệu chứng | Nguyên nhân |
+|---|---|
+| `tal merge` nói "không thấy CI nào" | chưa có workflow A, hoặc job không chạy trên PR đó |
+| `tal tests` in "chưa khai affectedTests" | thiếu khoá quan trọng nhất — quay lại mục 2 |
+| `tal pr` chặn vì "commit không map được" | tiêu đề commit thiếu `(#N)`, hoặc nhắc hai issue cùng lúc |
+| `tal batch claim` luôn exit 75 | backlog thiếu nhãn `agent:ready`, hoặc `batch.min` quá cao |
+| Agent bị deny khi chạy test | lệnh đó trùng chuỗi trong `fullSuite` — nó đúng là full suite |
+| Lease "quá hạn" liên tục | thiếu `tal renew` giữa các bước dài, hoặc `ttlSeconds` quá ngắn |
+
+---
+
+## 7. Nếu bạn đang dùng bản cũ (mỗi issue một vòng)
+
+| Cũ | Mới |
+|---|---|
+| `/loop /agent-loop:issue-work` | `/loop /agent-loop:batch-work` |
+| `/loop /agent-loop:issue-review` | `/loop /agent-loop:batch-review` |
+| `tal claim <N>` cho mọi issue | `tal batch claim` — `tal claim` chỉ còn cho ca submodule |
+| `tal merge-batch` | **đã gỡ.** Một PR đã là cả lô, nên một lần CI của PR đó đã là một lần cho cả lô |
+| `fullSuite` chạy ở cổng review | chỉ ở CI của PR vào main, hoặc `tal fullsuite` |
+| — | thêm `affectedTests`, `mainBranch`, `batch` vào config |
+
+Lease, ledger, nhãn và worktree cũ vẫn đọc được — không cần dọn tay. Chạy `tal gc` một lượt
+rồi `tal doctor` để xem còn thiếu gì.
+
+---
+
+## 8. Plugin KHÔNG làm gì
+
+Nói rõ để không ai chờ nhầm:
+
+- **Không** biết repo bạn chạy test thế nào — đó là `affectedTests` + `policyDocs.test`.
+- **Không** viết workflow CI hộ bạn — mục 3.
+- **Không** quyết issue nào đáng làm — đó là nhãn `agent:ready` do người gắn.
+- **Không** merge khi thiếu một trong hai cổng (review đạt, CI xanh), và không có đường vòng
+  nào ngoài `--force` do người gõ.
+- **Không** chạy full suite. Không bao giờ, trong vòng lặp.

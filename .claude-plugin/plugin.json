@@ -1,0 +1,16 @@
+{
+  "name": "agent-loop",
+  "description": "Nhiều session Claude Code cùng chạy một backlog GitHub issue mà không đạp lên nhau. Đơn vị công việc là một LÔ 10–20 issue: một worktree, một PR, MỘT lần review, MỘT lần CI. Lease nguyên tử (compare-and-swap trên git ref), fencing token, gỡ-một-issue-khỏi-lô, và full suite bị cấm trong vòng lặp.",
+  "author": {
+    "name": "godx-jp"
+  },
+  "homepage": "https://github.com/godx-jp/claude-agent-loop",
+  "repository": "https://github.com/godx-jp/claude-agent-loop",
+  "keywords": [
+    "github-issues",
+    "multi-agent",
+    "distributed-lock",
+    "worktree",
+    "code-review"
+  ]
+}

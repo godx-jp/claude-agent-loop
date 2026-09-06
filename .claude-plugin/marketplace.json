@@ -1,0 +1,17 @@
+{
+  "name": "godx",
+  "owner": {
+    "name": "godx-jp",
+    "url": "https://github.com/godx-jp"
+  },
+  "description": "Plugin Claude Code nội bộ của godx-jp.",
+  "plugins": [
+    {
+      "name": "agent-loop",
+      "source": "./",
+      "description": "Backlog GitHub issue chạy theo LÔ 10–20 issue: một PR, MỘT lần review, MỘT lần CI. Lease nguyên tử, fencing token, gỡ-một-issue-khỏi-lô, full suite bị cấm trong vòng lặp.",
+      "category": "workflow",
+      "tags": ["github-issues", "multi-agent", "distributed-lock", "worktree", "code-review"]
+    }
+  ]
+}
