@@ -7023,6 +7023,32 @@ def dangling_pointers() -> list[str]:
     return out
 
 
+def installed_plugin_sha() -> str | None:
+    """SHA của bản plugin ĐANG CHẠY, hoặc None nếu không nguồn nào nói được.
+
+    Hai nguồn, theo thứ tự tin cậy: sổ `installed_plugins.json` mà Claude Code ghi khi
+    cài (có `gitCommitSha`), rồi tới thư mục cài — bản cài từ marketplace nằm ở
+    `…/cache/<market>/<plugin>/<sha12>/`, nên tên thư mục chính là danh tính.
+
+    Trả None chứ KHÔNG đoán: một danh tính đoán sai còn tệ hơn không có, vì nó biến một
+    rào đang canh thành một rào khẳng định bừa."""
+    try:
+        f = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+        if f.is_file():
+            data = json.loads(f.read_text()).get("plugins") or {}
+            for name, entries in data.items():
+                if not name.startswith("agent-loop"):
+                    continue
+                for e in entries or []:
+                    if e.get("gitCommitSha"):
+                        return str(e["gitCommitSha"])
+    except Exception:                            # noqa: BLE001 — doctor không được chết vì một mục
+        pass
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT") or ""
+    m = re.search(r"/([0-9a-f]{7,40})/?$", root)
+    return m.group(1) if m else None
+
+
 def cmd_doctor(a):
     ok = True
 
@@ -7092,35 +7118,58 @@ def cmd_doctor(a):
         else:
             check(f"{r} delete_branch_on_merge", False, "đang tắt — `tal doctor --fix`")
 
-    print("\n`tal` ở worktree chính có phải bản mới nhất")
-    # Hook PreToolUse chạy `tal` của WORKTREE CHÍNH, không phải bản trên nhánh đang
-    # làm. Nên một bản vá đã merge vào base VẪN VÔ HIỆU cho tới khi cây chính được
-    # cập nhật — và không có gì báo. Đã trả giá: bản vá #1383 (rào lease thôi nhốt
-    # session) merge xong nhưng cây chính giữ bản cũ ⇒ rào cũ nhốt session lần thứ
-    # ba, và lần đó phải nhờ người chạy lệnh bên ngoài mới thoát.
+    print("\n`tal` đang chạy có phải bản kho mong đợi")
+    # Rào này sinh ra từ một sự cố thật (#1383 ở một kho tiêu thụ): hook `PreToolUse`
+    # chạy bản `tal` VENDOR trong cây chính, nên một bản vá đã merge vào base VẪN VÔ
+    # HIỆU cho tới khi cây chính được cập nhật — và không có gì báo. Đó là lớp lỗi tệ
+    # nhất của một công cụ tự động: bản sửa TỒN TẠI, ĐÃ MERGE, mà vẫn không có tác dụng.
     #
-    # Đây là lớp lỗi tệ nhất của một công cụ tự động: bản sửa TỒN TẠI, ĐÃ MERGE,
-    # mà vẫn không có tác dụng.
-    # Đường dẫn CỐ ĐỊNH, không phải `__file__`: bản đang chạy có thể là bản trong
-    # worktree của một issue, và khi đó `__file__` cho ra `.claude/worktrees/…/tal`
-    # — soi nhầm file, rồi báo "đã cũ" cho một thứ không phải cái hook dùng.
-    rel = Path(".claude") / "tools" / "agent-loop" / "tal"
-    try:
-        run(["git", "fetch", "-q", "origin", BASE_BRANCH], cwd=str(C.main_worktree), check=False)
-        local = run(["git", "hash-object", str(C.main_worktree / rel)],
-                    cwd=str(C.main_worktree)).stdout.strip()
-        remote = run(["git", "rev-parse", f"origin/{BASE_BRANCH}:{rel}"],
-                     cwd=str(C.main_worktree), check=False).stdout.strip()
-        if not remote:
-            check("so được với origin", False, "không đọc được bản trên origin — bỏ qua")
-        elif local == remote:
-            check(f"khớp origin/{BASE_BRANCH}", True)
+    # Ở thế giới plugin, kiểu hỏng ấy KHÔNG còn: hook chạy `${CLAUDE_PLUGIN_ROOT}/bin/tal`,
+    # tức bản đã cài, không phải một file trong repo. Nhưng bài học thì còn nguyên, chỉ
+    # đổi hình dạng — nay câu hỏi là "bản plugin đang chạy có đúng bản kho ghim không".
+    # Hai máy chạy hai bản khác nhau là hai `refNamespace`, là hai session không thấy
+    # lease của nhau: mất đúng thứ cả hệ thống tồn tại để bảo đảm.
+    #
+    # Nên rào đo theo ĐÚNG hình dạng mà kho đang dùng, chứ không giả định một hình dạng:
+    legacy = C.main_worktree / ".claude" / "tools" / "agent-loop" / "tal"
+    pinned = ((repo_cfg().get("plugin") or {}).get("commit") or "").strip()
+
+    if legacy.is_file():
+        # Kho còn vendor bản của mình — giữ nguyên phép đo cũ, nó vẫn đúng ở đây.
+        rel = legacy.relative_to(C.main_worktree)
+        try:
+            run(["git", "fetch", "-q", "origin", BASE_BRANCH], cwd=str(C.main_worktree), check=False)
+            local = run(["git", "hash-object", str(legacy)], cwd=str(C.main_worktree)).stdout.strip()
+            remote = run(["git", "rev-parse", f"origin/{BASE_BRANCH}:{rel}"],
+                         cwd=str(C.main_worktree), check=False).stdout.strip()
+            if not remote:
+                check("so được với origin", False, "không đọc được bản trên origin — bỏ qua")
+            elif local == remote:
+                check(f"bản vendor khớp origin/{BASE_BRANCH}", True)
+            else:
+                check(f"bản vendor khớp origin/{BASE_BRANCH}", False,
+                      f"ĐÃ CŨ — hook đang chạy bản này, nên bản vá đã merge vẫn vô hiệu. "
+                      f"Sửa: git -C {C.main_worktree} checkout origin/{BASE_BRANCH} -- {rel}")
+        except Exception as e:                  # noqa: BLE001 — doctor không được chết vì một mục
+            check("so với origin", False, f"không kiểm được: {e}")
+    elif not pinned:
+        # Không vendor, cũng không ghim. Chạy được, nhưng KHÔNG có gì bảo đảm hai máy
+        # dùng cùng một bản — nói ra thay vì im lặng cho qua.
+        check("kho ghim phiên bản plugin", False,
+              'chưa khai `"plugin": {"repo": …, "commit": "<sha>"}` trong config. `tal` là '
+              "khoá phân tán: hai máy hai bản là hai refNamespace, hai session không thấy "
+              "lease của nhau. Ghim SHA (không ghim tên nhánh — nhánh di chuyển).")
+    else:
+        running = installed_plugin_sha()
+        if running is None:
+            check("đọc được bản plugin đang chạy", False,
+                  "không nguồn nào nói được `tal` đang chạy là bản nào — kiểm lại cách cài")
+        elif running.startswith(pinned) or pinned.startswith(running):
+            check(f"khớp bản kho ghim ({pinned[:12]})", True)
         else:
-            check(f"khớp origin/{BASE_BRANCH}", False,
-                  f"ĐÃ CŨ — hook đang chạy bản này, nên bản vá đã merge vẫn vô hiệu. "
-                  f"Sửa: git -C {C.main_worktree} checkout origin/{BASE_BRANCH} -- {rel}")
-    except Exception as e:                      # noqa: BLE001 — doctor không được chết vì một mục
-        check("so với origin", False, f"không kiểm được: {e}")
+            check("khớp bản kho ghim", False,
+                  f"LỆCH — đang chạy {running[:12]}, kho ghim {pinned[:12]}. Nâng ghim sau khi "
+                  "đọc lại từng lời khai trong config trên `bin/tal` mới, hoặc cài đúng bản.")
 
     print("\ngitignore")
     gi = (C.main_worktree / ".gitignore").read_text() if (C.main_worktree / ".gitignore").exists() else ""
