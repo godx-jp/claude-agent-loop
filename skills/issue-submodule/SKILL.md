@@ -104,8 +104,9 @@ Cách sửa cho hook của repo:
 ## Chỉ submodule THẬT SỰ đổi mới cần branch
 
 Không phải "chạm issue là tạo branch ở cả 7 repo con". Chỉ repo con nào có file thay đổi
-mới cần `tal submodule <path>` + PR riêng. Sau một lần `omnify:gen`, kiểm bằng
-`git status --short` xem đúng những submodule nào hiện lên — chỉ tạo branch cho chúng.
+mới cần `tal submodule <path>` + PR riêng. Sau một lệnh codegen chạm nhiều repo con (ví dụ
+`omnify:gen` ở kho đo được), kiểm bằng `git status --short` xem đúng những submodule nào
+hiện lên — chỉ tạo branch cho chúng.
 `tal submodule-check` cũng chỉ xét submodule đã bị chạm: submodule chưa init, hoặc pointer
 và HEAD còn bằng base, đều được bỏ qua chứ không bị đòi branch.
 

@@ -46,6 +46,14 @@ cd <worktree>
 tal assert          # đọc lại: mình có thật đang giữ lô này không
 ```
 
+`tal assert` báo mất thẻ `.tal-lease.json` trong khi lease vẫn sống → `tal adopt` dựng lại
+thẻ từ sổ. Nó **không** bump epoch và **không** giành thêm gì; đó là lý do nó an toàn còn
+`tal claim` lại thì không.
+
+Issue đứng riêng (`tal claim <N>`) mà bạn biết trước nó sẽ ngồi lên một vùng file đang có
+người làm: khai vùng ra — `tal claim <N> --region backend/app/Services`. Chồng lấn với một
+lease đang sống thì tal **từ chối**, thay vì để hai session phát hiện nhau lúc merge.
+
 ## Bước 2 — với TỪNG issue trong lô
 
 Thứ tự trong một issue, không đảo:
@@ -88,7 +96,7 @@ tal tests --run         # chạy chúng
 ```
 
 **Full suite BỊ CẤM.** Không phải lời khuyên — `hook-guard` chặn thật. Nó chạy ở CI của PR
-vào `mainBranch`, hoặc do người gõ `tal fullsuite`.
+vào `promotionBranch` (`tal release-to-main`), hoặc do người gõ `tal fullsuite` từ gốc repo.
 
 Test đỏ mà không sửa được → gỡ issue gây đỏ ra khỏi lô (`tal batch drop`) hoặc nói thẳng
 trong thân PR. **Đừng mở PR khoe xanh.**

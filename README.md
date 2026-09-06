@@ -180,16 +180,23 @@ Hook chặn mọi tên khác, kể cả qua `git -C <submodule>`.
 | `tal submodule <path>` / `submodule-pr` / `submodule-check` | nghi thức repo con |
 | `tal review-queue` / `review-claim <PR>` | PR chờ review / giành quyền review |
 | `tal review-verdict <PR> pass\|changes` | kết luận review, một lần cho cả lô |
+| **`tal review-delta <PR>`** | **chỉ PHẦN MỚI kể từ verdict trước — vòng review ≥2 không đọc lại cả lô** |
 | `tal docs-check <PR>` | PR có cập nhật tài liệu đáng lẽ phải cập nhật chưa |
 | `tal merge-queue [-v]` / `tal merge <PR>` | PR đủ điều kiện / merge (review đạt + CI xanh) |
+| `tal merge-batch [--suite]` | gom mọi PR đã review đạt vào một cây tạm, chứng minh chúng đi cùng nhau được, rồi merge cả lô |
+| `tal pr-merge <PR>` | cả chuỗi trong một lệnh: PR con trước → chờ CI → kiểm con trỏ submodule → umbrella |
+| `tal adopt [N]` | dựng lại `.tal-lease.json` đã mất từ sổ — KHÔNG bump epoch |
+| `tal requeue <N> --note` | NGƯỜI mở khoá dead-letter: reset chuỗi thất bại, giữ sử liệu |
 | **`tal release-to-main`** | **mở PR `dev → main` — nơi DUY NHẤT full suite chạy** |
 | **`tal fullsuite [--force]`** | full suite do NGƯỜI gõ; từ chối chạy trong worktree vòng lặp |
 | `tal gc [--dry-run]` | thu hồi lease chết + xoá branch/worktree sau merge |
 | `tal status` | bảng điều phối: ai giữ lô nào, còn bao lâu |
 | `tal unlock <key> --force` | can thiệp tay khi chắc session giữ lease đã chết |
 
-Biến môi trường ghi đè config: `TAL_TTL`, `TAL_MAX_ATTEMPTS`, `TAL_BASE`, `TAL_MAIN`,
-`TAL_BATCH_MIN`, `TAL_BATCH_MAX`, `TAL_REF_NS`, `TAL_GRACE`, `TAL_SESSION`.
+Biến môi trường ghi đè config (env > `agent-loop.json` > mặc định): `TAL_TTL`,
+`TAL_GRACE`, `TAL_MAX_ATTEMPTS`, `TAL_BASE`, `TAL_PROMOTION`, `TAL_BATCH_MIN`,
+`TAL_BATCH_MAX`, `TAL_SESSION`. `refNamespace` **chỉ** đặt qua config — nó là danh tính
+của tập lease, không phải thứ để đổi cho một lượt chạy.
 
 ## Dọn rác
 
@@ -197,7 +204,9 @@ Biến môi trường ghi đè config: `TAL_TTL`, `TAL_MAX_ATTEMPTS`, `TAL_BASE`
 
 - thu hồi lease im lặng quá TTL (dead-letter nếu tái diễn `maxAttempts` lần);
 - xoá **branch remote của mọi PR đã merge** — repo chính và cả submodule;
-- xoá worktree + branch cục bộ khi PR đã merge (`--close` đóng luôn issue);
+- xoá worktree + branch cục bộ khi PR đã merge, và **đóng issue** (`--no-close` để chỉ gắn nhãn);
+- **không** xoá worktree còn nội dung chưa tới base — hỏi trước khi xoá, vì "worktree sạch"
+  không đồng nghĩa "đã ship";
 - **không** xoá worktree còn thay đổi chưa commit — nó báo và bỏ qua;
 - worktree của lô mà lease đã bị thu hồi thì chỉ **báo**, không xoá;
 - PR đóng mà không merge thì chỉ **báo** — cần `--include-abandoned`.

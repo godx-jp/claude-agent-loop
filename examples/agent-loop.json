@@ -2,9 +2,12 @@
   "//": "Copy vào .claude/agent-loop.json của repo bạn. Đây là CHÍNH SÁCH của repo — plugin chỉ mang cơ chế. Mọi khoá đều tuỳ chọn; thiếu thì dùng mặc định in ra bởi `tal config`.",
 
   "baseBranch": "dev",
-  "mainBranch": "main",
+  "promotionBranch": "main",
   "ttlSeconds": 2700,
   "maxAttempts": 3,
+
+  "//refNamespace": "Không gian ref dùng làm khoá CAS. ĐỪNG đổi trừ khi bạn hiểu hệ quả: hai bản tal chạy trên cùng repo với hai namespace khác nhau là hai tập lease KHÔNG thấy nhau, tức mất hẳn loại trừ tương hỗ — thứ duy nhất cả công cụ này tồn tại để bảo đảm. Cố ý không có biến môi trường nào đè được nó.",
+  "refNamespace": "refs/agent-loop/leases/",
 
   "//batch": "ĐƠN VỊ CÔNG VIỆC LÀ MỘT LÔ. Một lô = min..max issue → một worktree → một PR → MỘT lần review → MỘT lần CI. Chi phí cố định của một vòng gần như không phụ thuộc số issue trong đó; trả nó cho từng issue một là nhân lên 10–20 lần. Đừng để min < 5 — lô nhỏ là quay lại đúng cái đang phải chữa.",
   "batch": { "min": 10, "max": 20 },
@@ -39,8 +42,27 @@
     "pnpm typecheck"
   ],
 
-  "//submodulePrBase": "gitmodules (mặc định, an toàn) | default. gitmodules = base PR của submodule lấy từ trường branch trong .gitmodules, tức đúng nhánh umbrella theo dõi. Đổi sang 'default' chỉ khi default branch của repo con KHÔNG gắn auto-deploy. Lưu ý: issue chạm submodule KHÔNG đi đường lô — nó đi `tal claim <N>` một mình.",
-  "submodulePrBase": "gitmodules",
+  "//setup": "Lệnh dựng môi trường trong CÂY TẠM của `tal merge-batch`. Cây tạm là worktree mới tinh: mọi thứ nằm trong .gitignore (vendor/, node_modules/, .env, submodule chưa init) đều KHÔNG có. Không khai thì cổng gom lô đỏ 100% vì thiếu binary — đó là CỔNG HỎNG, không phải test đỏ.",
+  "setup": [
+    "cd backend && composer install --no-interaction --prefer-dist",
+    "pnpm install --frozen-lockfile"
+  ],
+
+  "//setupVerify": "Kiểm rẻ tiền chứng minh `setup` đã xong. Bắt đúng ca setup xanh mà vẫn thiếu thứ fullSuite cần — thường là fullSuite vừa được thêm lệnh mới còn setup không theo.",
+  "setupVerify": [
+    "test -x backend/vendor/bin/pest"
+  ],
+
+  "//agentLogins": "Tài khoản GitHub mà các session agent đẩy PR qua. Rỗng ⇒ KHÔNG lọc theo tác giả, và khi đó PR do NGƯỜI mở (cùng quy ước nhánh issue-<N>) bị xếp vào rổ mồ côi — một session có thể ghi verdict lên việc họ đang làm.",
+  "agentLogins": [],
+
+  "//riskDomains": "Diff chạm các đường dẫn này thì REVIEW phải ở tier cao nhất. `tal config` in ra cho skill đọc; tal không tự chặn theo khoá này.",
+  "riskDomains": [],
+
+  "//formatCmd": "Lệnh format của repo, để skill gọi đúng thay vì đoán.",
+  "formatCmd": "",
+
+  "//submodule": "Base PR của submodule LUÔN lấy từ trường branch trong .gitmodules — tức đúng nhánh umbrella đang theo dõi, không phải default branch của repo con. Không có khoá cấu hình nào cho việc này, có chủ ý. Lưu ý: issue chạm submodule KHÔNG đi đường lô — nó đi `tal claim <N>` một mình.",
 
   "//labels": "Bốn nhãn đầu là quy ước SẴN CÓ của repo — khai đúng tên repo đang dùng để bảng issue không bị chẻ làm hai hệ. Để rỗng nếu repo không dùng nhãn đó. Năm nhãn agent:* do plugin sở hữu, `tal doctor --fix` tự tạo.",
   "labels": {

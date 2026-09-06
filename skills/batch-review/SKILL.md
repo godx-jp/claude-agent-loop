@@ -69,8 +69,18 @@ Thân PR mô tả khác diff → **đừng kết luận tác giả chưa sửa**
 commit message, rồi nêu chênh lệch dưới dạng `todo` về thân PR, **không** phải
 `issue (blocking)` về code.
 
-**Vòng ≥ 2:** đối chiếu từng điểm `(blocking)` vòng trước. Điểm còn sót là điểm cũ lặp lại
-— nói vậy, đừng trình bày như phát hiện mới. Điểm đã xử lý thì ghi nhận một dòng.
+**Vòng ≥ 2: đừng đọc lại cả lô.**
+
+```sh
+tal review-delta <PR>
+```
+
+Verdict trước đã ghi `sha=` của bản đã xem, nên "cái gì mới" là một phép **trừ**, không
+phải phán đoán. Đọc lại 20 issue để tìm 1 thay đổi là trả lại nguyên chi phí mà mô hình lô
+vừa tiết kiệm được.
+
+Rồi đối chiếu từng điểm `(blocking)` vòng trước. Điểm còn sót là điểm cũ lặp lại — nói vậy,
+đừng trình bày như phát hiện mới. Điểm đã xử lý thì ghi nhận một dòng.
 
 ## Bước 3 — soi
 
@@ -114,7 +124,7 @@ tal tests --pr <PR>          # lệnh test liên quan tới diff của PR này
 ```
 
 Chỉ chạy đủ để kiểm điều mình đang nghi. **Full suite BỊ CẤM** — `hook-guard` chặn thật.
-Nó chạy ở CI của PR vào `mainBranch`, không phải ở đây.
+Nó chạy ở CI của PR vào `promotionBranch`, không phải ở đây.
 
 ## Bước 5 — kết luận MỘT lần cho cả lô, rồi ĐỌC LẠI
 
@@ -147,6 +157,14 @@ tal merge <PR>
 Rào hai điều kiện, cưỡng chế bằng máy: **review đạt** và **CI của chính PR này xanh**. CI
 đó chạy test liên quan, không phải full suite — và vì PR gộp cả lô, một lần CI đó là một
 lần cho cả lô. **Không bao giờ `--force`.**
+
+PR có PR con ở submodule → `tal pr-merge <PR>` đi cả chuỗi trong một lệnh: merge con trước,
+chờ CI, kiểm con trỏ đã trỏ đúng sha đã merge, rồi mới merge umbrella. Gõ tay từng chặng là
+cách con trỏ dangling lọt lên base.
+
+Nhiều PR đã review đạt cùng lúc → `tal merge-batch` trộn chúng vào một cây tạm và chứng
+minh chúng đi cùng nhau được trước khi merge lần lượt. Mặc định nó **không** chạy full
+suite; `--suite` mới chạy, và đó là quyết định của người.
 
 Sau merge, đọc lại: `gh pr view <PR> --json state,mergedAt`.
 

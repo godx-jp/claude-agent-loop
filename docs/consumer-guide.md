@@ -13,7 +13,7 @@ bạn chạy test thế nào, quy ước gì, đã cháy ở đâu.
 | Cần | Vì sao |
 |---|---|
 | `git`, `gh` đã `gh auth login`, `python3` (stdlib) | tal không dùng `jq`, không dùng `flock` |
-| Repo trên GitHub, có `baseBranch` (vd `dev`) và `mainBranch` (vd `main`) | lô vào base; full suite ở PR base→main |
+| Repo trên GitHub, có `baseBranch` (vd `dev`) và `promotionBranch` (vd `main`) | lô vào base; full suite ở PR base→promotion |
 | GitHub Issues bật | ledger sống trong comment của issue |
 | CI chạy được trên PR | `tal merge` đòi CI của chính PR đó xanh |
 
@@ -52,10 +52,20 @@ cấu hình máy cá nhân.
 | Khoá | Không khai thì sao |
 |---|---|
 | `baseBranch` | mặc định `"dev"`. Sai là mọi PR nhắm sai nhánh |
-| `mainBranch` | mặc định `"main"`. `tal release-to-main` mở PR vào đây |
+| `promotionBranch` | mặc định `"main"`. `tal release-to-main` mở PR vào đây. Tên cũ `mainBranch` vẫn được đọc |
+| **`refNamespace`** | mặc định `"refs/agent-loop/leases/"`. **Chỉ đổi khi bạn hiểu hệ quả:** hai bản `tal` chạy trên cùng repo với hai namespace khác nhau là hai tập lease **không thấy nhau**, tức mất hẳn loại trừ tương hỗ — đúng thứ duy nhất công cụ này tồn tại để bảo đảm. Không có env nào đè được nó, có chủ ý |
 | **`affectedTests`** | **`tal tests` không suy ra được lệnh nào — vai code mất hẳn cách chạy test đúng phạm vi.** Đây là khoá quan trọng nhất |
 | `fullSuite` | `tal fullsuite` không chạy được, và **`hook-guard` không có gì để chặn** — full suite lọt vào vòng lặp |
 | `policyDocs` | skill chỉ có luật chung, không biết quy ước repo |
+
+### Tuỳ chọn, nhưng nên khai
+
+| Khoá | Việc |
+|---|---|
+| `setup` / `setupVerify` | lệnh dựng môi trường trong cây tạm của `tal merge-batch`, và kiểm rẻ tiền chứng minh nó đã dựng xong. Không khai thì cổng gom lô đỏ 100% vì thiếu `vendor/`, `node_modules/`, `.env` — **cổng hỏng**, không phải test đỏ |
+| `agentLogins` | tài khoản GitHub mà session agent đẩy PR qua. Không khai thì `review-queue` xếp **PR của người** vào rổ mồ côi, và một session có thể ghi verdict lên việc họ đang làm |
+| `riskDomains` | đường dẫn mà diff chạm vào thì review phải ở tier cao nhất. `tal config` in ra cho skill đọc |
+| `formatCmd` | lệnh format của repo, để skill gọi đúng thay vì đoán |
 
 ### `affectedTests` — viết cho đúng
 
@@ -268,7 +278,7 @@ Một job, một tên check. `tal merge` đọc `gh pr checks` và chặn khi **
 name: Full suite
 on:
   pull_request:
-    branches: [main]         # = mainBranch
+    branches: [main]         # = promotionBranch
   workflow_dispatch:
 
 jobs:
@@ -301,6 +311,20 @@ nên có, nên nó chạy bình thường. Đây là **nơi duy nhất** full su
 
 `hook-guard` đã chặn agent push thẳng vào base/main, nhưng branch protection là tầng chặn
 duy nhất không phụ thuộc việc agent có chạy qua hook hay không.
+
+### C. Cổng chống-xoá-file cho lượt promote — nửa mà plugin KHÔNG phủ được
+
+`tal merge --promote` từ chối merge PR `base → promotion` nếu nhánh phát hành có file mà
+nhánh nguồn không có (hotfix vá thẳng lên production, chưa quay ngược về base). Nhưng rào
+đó chỉ phủ **đường `tal`**. Người gõ `gh pr merge` hay bấm nút trên web thì không đi qua
+nó, và hai lượt promote gần nhất ở kho đã đo được đều đi đường sau.
+
+Nên nửa còn lại phải sống ở CI của **bạn**: một workflow chạy trên PR có
+`head_ref == <baseBranch>`, không bị `paths:` lọc (rào này phát biểu về file **không** nằm
+trong diff, tức đúng thứ bộ lọc theo path không nhìn thấy), đo đúng chiều
+`origin/<base>..origin/<promotion>` với `--diff-filter=A --no-renames -z`. Đảo chiều hay bỏ
+một cờ đều làm cổng **im lặng báo sạch**, và một cổng báo sạch nguy hiểm hơn một cổng không
+tồn tại.
 
 ---
 
@@ -392,6 +416,10 @@ Tình huống hay gặp:
 | `tal batch claim` luôn exit 75 | backlog thiếu nhãn `agent:ready`, hoặc `batch.min` quá cao |
 | Agent bị deny khi chạy test | lệnh đó trùng chuỗi trong `fullSuite` — nó đúng là full suite |
 | Lease "quá hạn" liên tục | thiếu `tal renew` giữa các bước dài, hoặc `ttlSeconds` quá ngắn |
+| Mất `.tal-lease.json` mà lease vẫn sống | `tal adopt [N]` dựng lại thẻ từ sổ, **không** bump epoch |
+| Issue dính `agent:dead-letter` | `tal requeue <N> --note "vì sao lần này khác"` — đường chính danh, giữ sử liệu |
+| Vòng review thứ hai phải đọc lại cả lô | `tal review-delta <PR>` in đúng phần mới kể từ verdict trước |
+| Hai issue khác nhau đụng cùng thư mục | `tal claim <N> --region <path>` giữ vùng file; chồng lấn với lease sống khác thì bị từ chối |
 
 ---
 
@@ -402,9 +430,9 @@ Tình huống hay gặp:
 | `/loop /agent-loop:issue-work` | `/loop /agent-loop:batch-work` |
 | `/loop /agent-loop:issue-review` | `/loop /agent-loop:batch-review` |
 | `tal claim <N>` cho mọi issue | `tal batch claim` — `tal claim` chỉ còn cho ca submodule |
-| `tal merge-batch` | **đã gỡ.** Một PR đã là cả lô, nên một lần CI của PR đó đã là một lần cho cả lô |
+| `tal merge-batch` mỗi vòng | vẫn còn, nhưng **đổi vai**: nó gom nhiều PR đã review đạt vào một cây tạm để chứng minh chúng đi cùng nhau được. Mặc định **không** chạy full suite (`--suite` mới chạy) |
 | `fullSuite` chạy ở cổng review | chỉ ở CI của PR vào main, hoặc `tal fullsuite` |
-| — | thêm `affectedTests`, `mainBranch`, `batch` vào config |
+| — | thêm `affectedTests`, `promotionBranch`, `batch`, `setup`/`setupVerify` vào config |
 
 Lease, ledger, nhãn và worktree cũ vẫn đọc được — không cần dọn tay. Chạy `tal gc` một lượt
 rồi `tal doctor` để xem còn thiếu gì.
