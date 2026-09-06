@@ -1390,6 +1390,192 @@ def cmd_release_to_main(a):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# requeue / adopt — hai đường CHÍNH DANH cho NGƯỜI, không phải cửa sau
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def cmd_requeue(a):
+    """Đường chính danh cho NGƯỜI mở khoá dead-letter.
+
+    Không có nó thì cả ba lối thoát còn lại đều hỏng thứ khác: gỡ nhãn tay bị đồng bộ
+    dán lại (ledger mới là nguồn sự thật), `tal unlock` reset state nhưng GIỮ counter
+    nên lần claim kế tiếp lại rơi dead-letter ngay, còn `TAL_MAX_ATTEMPTS` + `--force`
+    là cửa ngầm không để lại dấu vết.
+
+    Requeue reset `review_rounds`/`reaps` — chuỗi thất bại làm lại từ đầu — nhưng GIỮ
+    `attempts` và toàn bộ history: đó là sử liệu, xoá đi là mất khả năng thấy một issue
+    đã quay lại đây bao nhiêu lần."""
+    issue = a.issue
+    if not (getattr(a, "note", "") or "").strip():
+        raise Fail('`tal requeue` bắt buộc --note "<vì sao lần này sẽ khác>" — người mở '
+                   "khoá phải nói được điều gì đã đổi: root cause đã rõ, phạm vi thu hẹp, "
+                   "hay một quyết định mới. Mở khoá mà không có câu đó là mở để thất bại lại.", 2)
+    d0 = issue_data(issue)
+    if d0["state"] != "open":
+        raise Fail(f"#{issue} đang {d0['state']} — mở lại issue trước rồi hẵng requeue", 2)
+    key = f"issue-{issue}"
+    if ref_exists(key):
+        raise Fail(f"{key}: đang có lease sống — requeue chỉ dành cho issue KHÔNG ai giữ. "
+                   "Lease chết thật thì chờ `tal gc`, hoặc `tal unlock` trước.", BUSY)
+    led, cid, _ = ledger_read(issue)
+    if led.get("state") != "dead_letter" and L_DEAD not in set(d0.get("labels") or []):
+        warn(f"#{issue} không ở dead-letter (state={led.get('state')!r}) — vẫn reset "
+             "counter theo yêu cầu")
+    led["state"] = "queued"
+    led["lease"] = None
+    led["batch"] = None
+    led["review_rounds"] = 0
+    led["reaps"] = 0
+    ledger_write(led, cid, f"requeue bởi {session_id()[:8]}… — {a.note.strip()}")
+    for n in led.get("group", [issue]):
+        set_state_labels(n, {L_READY} if L_READY else set())
+    out = {"issue": issue, "state": "queued", "review_rounds": 0, "reaps": 0,
+           "attempts": led.get("attempts", 0)}
+    if a.json:
+        return emit(out, True)
+    print(f"#{issue} → queued (review_rounds/reaps reset, attempts giữ nguyên "
+          f"{led.get('attempts', 0)}) — nhãn {L_READY} đã gắn, {L_DEAD}/{L_BLOCKED} đã gỡ")
+    return out
+
+
+def adopt_target(explicit: int | None) -> tuple[int, str | None]:
+    """→ (issue neo, tên lô nếu là worktree của lô). Thẻ mất thì `lease_file()` không
+    nói được đây là gì — hỏi chỗ khác.
+
+    Thứ tự: người nói > tên thư mục worktree > sổ trên GitHub. Hai nguồn đầu chỉ là
+    MANH MỐI để biết hỏi sổ nào; quyền quyết định ai giữ lease nằm trọn ở bước sau, nên
+    đoán sai ở đây cũng không cấp thêm quyền cho ai."""
+    if explicit:
+        return explicit, None
+
+    p = Path.cwd().resolve()
+    try:
+        wtdir = C.worktrees_dir.resolve()
+    except OSError:
+        wtdir = C.worktrees_dir
+    for cand in [p] + list(p.parents):
+        if cand.parent != wtdir:
+            continue
+        m = re.fullmatch(r"issue-(\d+)", cand.name)
+        if m:
+            return int(m.group(1)), None
+        if is_batch(cand.name):
+            # Thư mục lô không mang số issue nào. Hỏi NGUỒN CÓ THẨM QUYỀN: ref nào
+            # đang sống, sổ nào ghi lô này và ghi mình là chủ.
+            for key in refs_all():
+                mm = re.fullmatch(r"issue-(\d+)", key)
+                if not mm:
+                    continue
+                led, _, _ = ledger_read(int(mm.group(1)))
+                lease = led.get("lease") or {}
+                if lease.get("batch") == cand.name and lease.get("session") == session_id():
+                    return lease.get("anchor") or int(mm.group(1)), cand.name
+            raise Fail(f"{cand.name}: không sổ nào ghi lô này là của session hiện tại — "
+                       "không có gì để dựng lại thẻ.", 3)
+
+    mine: list[int] = []
+    for key in refs_all():
+        m = re.fullmatch(r"issue-(\d+)", key)
+        if not m:
+            continue
+        led, _, _ = ledger_read(int(m.group(1)))
+        if (led.get("lease") or {}).get("session") == session_id():
+            mine.append(int(m.group(1)))
+    if len(mine) == 1:
+        return mine[0], None
+    if len(mine) > 1:
+        raise Fail("session này đang giữ nhiều lease: "
+                   + ", ".join(f"#{n}" for n in sorted(mine))
+                   + " — nói rõ issue nào: `tal adopt <issue>`", 3)
+    raise Fail("không thấy lease nào của session này trên sổ — không có gì để dựng lại. "
+               "`tal status` xem ai đang giữ gì; `tal claim`/`tal batch claim` nếu muốn "
+               "nhận mới.", 3)
+
+
+def cmd_adopt(a):
+    """Dựng lại `.tal-lease.json` từ sổ — KHÔNG bump epoch, KHÔNG giành thêm gì.
+
+    Thẻ trên đĩa là *cache* của một trạng thái sống trên GitHub, nhưng nó là đường duy
+    nhất để `renew|assert|pr|release` biết mình đang giữ gì. Mất thẻ trong khi lease vẫn
+    sống ⇒ cả bốn lệnh rơi vào exit 3, và hai lối thoát còn lại đều phá thứ khác: claim
+    lại thì **bump epoch** (đúng cái fencing token sinh ra để ngăn), `unlock --force` thì
+    **vứt một lease đang sống**.
+
+    Lệnh này KHÔNG phải cửa sau. Hai điều kiện giữ nó khỏi thành cửa sau — nó chỉ KHÔI
+    PHỤC thứ mà ref + sổ đã công nhận là của mình:
+
+      1. sổ phải ghi `lease.session == session_id()`;
+      2. ref CAS của issue neo phải còn sống.
+
+    Thiếu một trong hai ⇒ TỪ CHỐI. Lease của session khác là ca cần người.
+
+    Cố ý KHÔNG ghi gì lên sổ: `ledger_write` luôn đặt lại `heartbeat`, mà TTL đo theo
+    `updated_at` của chính comment ấy — một dòng history vô hại sẽ lặng lẽ GIA HẠN lease.
+    Adopt phải là thao tác chỉ-đọc phía GitHub, nếu không nó cấp thêm thời gian mà người
+    gọi không hề xin."""
+    issue, batch_hint = adopt_target(a.issue)
+    led, cid, upd = ledger_read(issue)
+    lease = led.get("lease") or {}
+
+    if not lease:
+        raise Fail(f"#{issue}: sổ ghi KHÔNG session nào đang giữ (state={led.get('state')!r}). "
+                   f"Không có lease để dựng lại thẻ — `tal claim {issue}` nếu muốn nhận.", 3)
+    owner = lease.get("session") or ""
+    if owner != session_id():
+        raise Fail(
+            f"#{issue}: lease thuộc session {owner[:8] or '(trống)'}…, KHÔNG phải bạn "
+            f"({session_id()[:8]}…). `adopt` chỉ dựng lại thẻ cho lease của CHÍNH mình — nó "
+            f"không giành được gì. Đây là ca cần người: `tal status` xem ai giữ, và chỉ khi "
+            f"chắc chắn session đó đã chết mới `tal unlock issue-{issue} --force`.", 5)
+    key = f"issue-{issue}"
+    if not ref_exists(key):
+        raise Fail(
+            f"#{issue}: sổ ghi lease là của bạn nhưng ref {key} KHÔNG còn — lease đã bị thu "
+            f"hồi (gc/unlock) và sổ chưa kịp dọn. Không dựng lại thẻ cho một lease đã chết; "
+            f"nhận lại bằng `tal claim {issue}` (epoch sẽ tăng, đúng như phải thế).", 3)
+
+    batch = lease.get("batch") or batch_hint
+    group = led.get("group", [issue])
+    keys = lease.get("keys") or [f"issue-{n}" for n in group]
+    branch = led.get("branch") or batch or f"issue-{issue}"
+    epoch = lease.get("epoch", led.get("epoch"))
+    expired = lease_expired(led, upd)
+
+    for k in keys:
+        if k != key and not ref_exists(k):
+            warn(f"{k}: ref của issue cùng nhóm/lô đã mất — không còn nguyên vẹn, kiểm "
+                 "`tal status` trước khi ghi (`tal batch drop` gỡ hẳn nó ra)")
+        if not local_lock(k):
+            warn(f"{k}: khoá cục bộ đang do session khác trên máy này giữ, dù sổ + ref nói "
+                 "lease là của bạn — kiểm `tal status` trước khi ghi")
+
+    # `ensure_worktree` là chỗ duy nhất biết ba ca: thư mục còn và gắn đúng (dùng lại),
+    # thư mục mất (dựng lại từ branch), thư mục còn mà đăng ký git đã prune (từ chối).
+    wt = ensure_worktree(branch)
+
+    card = {"repo": C.repo, "issue": issue, "group": group, "branch": branch,
+            "epoch": epoch, "session": session_id(), "keys": keys,
+            "comment_id": cid, "acquired_at": lease.get("acquired_at")}
+    if batch:
+        card.update({"kind": "batch", "batch": batch, "anchor": issue, "issues": group})
+    (wt / LEASE_FILE).write_text(json.dumps(card, indent=2))
+
+    out = {"issue": issue, "batch": batch, "group": group, "branch": branch,
+           "worktree": str(wt), "epoch": epoch, "session": session_id(),
+           "expired": expired, "adopted": True}
+    if expired:
+        warn(f"#{issue}: lease đã QUÁ HẠN theo đồng hồ server — thẻ đã dựng lại nhưng "
+             "`tal assert` sẽ vẫn từ chối. Chạy `tal renew` NGAY, và biết rằng `tal gc` có "
+             "thể đã cấp issue này cho người khác.")
+    if a.json:
+        return emit(out, True)
+    print(f"đã dựng lại thẻ lease {batch or '#' + str(issue)} epoch={epoch} "
+          "(GIỮ NGUYÊN, không bump)")
+    print(f"worktree: {wt}\nbranch:   {branch}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Worktree + submodule
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2124,6 +2310,128 @@ def cmd_merge(a):
     return {"pr": pr, "issue": issue}
 
 
+def full_suite_cmds() -> list[str]:
+    return CFG.get("fullSuite") or []
+
+
+def setup_cmds() -> list[str]:
+    """Lệnh dựng môi trường trong cây tạm, chạy TRƯỚC `fullSuite`. Khai trong config
+    chứ không ghi cứng: stack đổi thì cổng phải đổi theo mà không phải sửa tool."""
+    return CFG.get("setup") or []
+
+
+def setup_verify_cmds() -> list[str]:
+    """Kiểm cây tạm đã dựng ĐỦ chưa, trước khi chạy suite. Bắt đúng ca `setup` xanh
+    mà vẫn thiếu thứ suite cần — nếu không, thiếu môi trường sẽ hiện ra dưới dạng
+    'test đỏ' và người đọc đi tìm sai chỗ."""
+    return CFG.get("setupVerify") or []
+
+
+def cmd_merge_batch(a):
+    """Trộn mọi PR đã review đạt vào MỘT cây tạm, chứng minh chúng đi cùng nhau được,
+    rồi merge lần lượt.
+
+    Vì sao vẫn cần khi đơn vị công việc đã là lô: nhiều session mở nhiều PR-lô song
+    song, cộng PR của người. "Hai PR đều xanh riêng lẻ" KHÔNG suy ra "xanh khi nằm
+    cạnh nhau", mà cạnh nhau mới là trạng thái base sẽ ở. Cổng này cũng là chỗ duy
+    nhất bắt được conflict gitlink trước khi nó nổ trên base.
+
+    FULL SUITE LÀ OPT-IN (`--suite`), không phải mặc định. Đo ở kho thật: nó chạy ít
+    nhất 6 lần trong một phiên, 9–10 phút mỗi lần, và bắt được đúng MỘT thứ mà test
+    hẹp của cùng thư mục cũng bắt được — đổi lại nó khoá chết một cặp PR bù nhau tới
+    mức phải --force mới ra. Cây tạm VẪN dựng và VẪN trộn thật; chỉ cái suite là tuỳ.
+
+    Cây tạm dùng detached HEAD, KHÔNG tạo branch — luật tên không có chỗ cho một
+    nhánh tích hợp, và không cần có."""
+    want_suite = getattr(a, "suite", False)
+    cmds = full_suite_cmds() if want_suite else []
+    if want_suite and not cmds:
+        raise Fail("chưa khai `fullSuite` trong .claude/agent-loop.json — không biết chạy "
+                   "gì để chứng minh cả lô xanh.", 2)
+
+    prs = gh_json(["pr", "list", "-R", C.repo, "--state", "open", "--limit", "50",
+                   "--json", "number,title,headRefName,isDraft,headRefOid,body"], default=[])
+    lot = []
+    for pr in prs:
+        if pr["isDraft"] or not TRACKED_HEAD.match(pr["headRefName"]):
+            continue
+        issue, why = merge_blockers(pr["number"])
+        if why:
+            continue
+        lot.append({"pr": pr["number"], "issue": issue, "sha": pr["headRefOid"],
+                    "branch": pr["headRefName"], "title": pr["title"]})
+    lot.sort(key=lambda x: x["pr"])
+    if a.limit:
+        lot = lot[: a.limit]
+    if not lot:
+        print("không có PR nào đủ điều kiện merge — lô rỗng")
+        return {"lot": [], "verified": False}
+
+    print(f"lô {len(lot)} PR: " + ", ".join(f"#{x['pr']}" for x in lot))
+    if a.dry_run:
+        return emit({"lot": lot, "verified": False, "dry_run": True}, a.json)
+
+    root = C.main_worktree
+    tmp = C.worktrees_dir / f"_batch-{session_id()[:8]}"
+    run(["git", "worktree", "remove", "--force", str(tmp)], cwd=str(root), check=False)
+    shutil.rmtree(tmp, ignore_errors=True)   # remove có thể fail; thư mục sót lại thì add chết
+    run(["git", "worktree", "prune"], cwd=str(root), check=False)
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "fetch", "-q", "--prune", "origin"], cwd=str(root), check=False)
+    run(["git", "worktree", "add", "--detach", str(tmp), f"origin/{BASE_BRANCH}"], cwd=str(root))
+    exclude_lease(tmp)
+
+    ejected: list[dict] = []
+    try:
+        run(["git", "submodule", "update", "--init", "--recursive"], cwd=str(tmp), check=False)
+        merged_in = []
+        for x in list(lot):
+            m = run(["git", "merge", "--no-edit", x["sha"]], cwd=str(tmp), check=False)
+            if m.returncode != 0:
+                # EJECT, không huỷ cả lô: một nhánh cũ không được giữ con tin hàng đợi.
+                run(["git", "merge", "--abort"], cwd=str(tmp), check=False)
+                lot.remove(x)
+                ejected.append({**x, "why": (m.stdout + m.stderr).strip()[-400:]})
+                gh(["pr", "comment", str(x["pr"]), "-R", C.repo, "-b",
+                    f"<!-- {REVIEW_MARKER}:eject -->\n**Bị bỏ khỏi lô merge** — conflict khi "
+                    f"trộn lên `{BASE_BRANCH}` cùng các PR khác. Các PR còn lại vẫn đi tiếp.\n\n"
+                    f"Merge `{BASE_BRANCH}` vào nhánh này, giải conflict, rồi để cổng chạy lại."],
+                   check=False)
+                continue
+            merged_in.append(x)
+        if not merged_in:
+            raise Fail(f"mọi PR đều conflict khi trộn — không merge gì. Bị bỏ: "
+                       + ", ".join(f"#{e['pr']}" for e in ejected), 2)
+        print(f"đã trộn {len(merged_in)} PR lên origin/{BASE_BRANCH} trong cây tạm"
+              + (f" · BỎ {len(ejected)} PR conflict" if ejected else ""))
+
+        if cmds:
+            for stage, batch_cmds in (("setup", setup_cmds()),
+                                      ("setupVerify", setup_verify_cmds()),
+                                      ("fullSuite", cmds)):
+                for c in batch_cmds:
+                    print(f"  [{stage}] $ {c}")
+                    r = run(["bash", "-lc", c], cwd=str(tmp), check=False)
+                    tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-15:])
+                    if r.returncode != 0:
+                        # Phân biệt CỔNG HỎNG với TEST ĐỎ: lẫn hai cái là đi tìm sai chỗ.
+                        code = 3 if stage != "fullSuite" else 2
+                        raise Fail(f"{'CỔNG HỎNG' if code == 3 else 'full suite ĐỎ'} ở "
+                                   f"[{stage}] — KHÔNG merge gì cả:\n{tail}", code)
+            print("full suite XANH cho cả lô")
+        else:
+            print("KHÔNG chạy full suite (mặc định). Cần nó thì `tal merge-batch --suite`.")
+    finally:
+        run(["git", "worktree", "remove", "--force", str(tmp)], cwd=str(root), check=False)
+        shutil.rmtree(tmp, ignore_errors=True)
+        run(["git", "worktree", "prune"], cwd=str(root), check=False)
+
+    merged = []
+    for x in lot:
+        merged.append(cmd_merge(argparse.Namespace(pr=x["pr"], force=False, json=False)))
+    return {"lot": lot, "ejected": ejected, "verified": bool(cmds), "merged": merged}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GC — thu hồi lease chết + xoá sạch branch sau merge
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2686,6 +2994,16 @@ def main() -> int:
     add("renew", cmd_renew, "gia hạn lease (heartbeat) — gọi sau mỗi bước dài")
     add("assert", cmd_assert, "fencing check: còn quyền ghi hay không")
 
+    p = add("requeue", cmd_requeue,
+            "NGƯỜI mở khoá dead-letter: reset chuỗi thất bại, giữ sử liệu")
+    p.add_argument("issue", type=int)
+    p.add_argument("--note", help="BẮT BUỘC: vì sao lần này sẽ khác")
+
+    p = add("adopt", cmd_adopt,
+            "dựng lại .tal-lease.json đã mất từ sổ — KHÔNG bump epoch, không giành thêm")
+    p.add_argument("issue", type=int, nargs="?",
+                   help="bỏ trống = suy từ worktree đang đứng, hoặc từ sổ")
+
     p = add("release", cmd_release, "nhả lease")
     p.add_argument("--state", choices=["review", "blocked", "abandon", "no-op", "shipped"],
                    required=True,
@@ -2732,6 +3050,13 @@ def main() -> int:
 
     p = add("merge-queue", cmd_merge_queue, "PR đủ điều kiện merge (review đạt + CI xanh)")
     p.add_argument("-v", "--verbose", action="store_true", help="kèm lý do chưa đủ điều kiện")
+
+    p = add("merge-batch", cmd_merge_batch,
+            "trộn mọi PR đã review đạt trong cây tạm, chứng minh đi cùng nhau được, rồi merge")
+    p.add_argument("--dry-run", action="store_true", help="chỉ in lô, không trộn không merge")
+    p.add_argument("--limit", type=int, help="chỉ lấy N PR đầu")
+    p.add_argument("--suite", action="store_true",
+                   help="chạy full suite trên lô đã trộn (OPT-IN — mặc định KHÔNG chạy)")
 
     p = add("merge", cmd_merge, "merge MỘT PR — đòi review đạt và CI (test liên quan) xanh")
     p.add_argument("pr", type=int)

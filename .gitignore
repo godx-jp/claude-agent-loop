@@ -1,2 +1,5 @@
 .claude/worktrees/
 .tal-lease.json
+
+__pycache__/
+*.pyc
