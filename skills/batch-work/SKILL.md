@@ -101,8 +101,9 @@ vào `promotionBranch` (`tal release-to-main`), hoặc do người gõ `tal full
 Test đỏ mà không sửa được → gỡ issue gây đỏ ra khỏi lô (`tal batch drop`) hoặc nói thẳng
 trong thân PR. **Đừng mở PR khoe xanh.**
 
-Cạm bẫy đáng biết: test có thể chạy trên engine khác production (SQLite vs MySQL). Thay
-đổi **DDL** thì kiểm thêm trên engine thật, và nói rõ đã kiểm ở đâu.
+Cạm bẫy đáng biết: **engine test có thể khác engine production**. Thay đổi **DDL** thì
+kiểm thêm trên engine thật, và nói rõ đã kiểm ở đâu. Repo bạn dùng engine gì —
+`policyDocs.test` khai; skill không đoán hộ.
 
 ## Bước 4 — MỘT PR cho cả lô
 

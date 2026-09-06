@@ -22,6 +22,39 @@ ref thử — nếu nó đỏ thì **đừng chạy nhiều session**, khoá kh�
 
 ---
 
+## 0b. Ranh giới: plugin mang CƠ CHẾ, repo mang CHÍNH SÁCH
+
+Đây là luật quyết định mọi tranh cãi về "cái này để đâu". Hỏi đúng một câu, cho
+TỪNG ĐOẠN — không phải từng file:
+
+> **Câu này còn đúng ở một kho stack khác không?**
+
+| Đúng ⇒ thuộc **plugin** | Không ⇒ thuộc **repo bạn** |
+|---|---|
+| lease, fencing, hàng đợi, gc, luật tên nhánh | lệnh test theo vùng (`affectedTests`) |
+| hai vai code/review và ranh giới giữa chúng | lệnh "chạy tất" (`fullSuite`) |
+| cạm bẫy chung: `cd` không phải rào, merge PR của chính mình | bẫy của ngôn ngữ/framework bạn dùng |
+| runbook sự cố: session bị nhốt, lease mồ côi | bản đồ code→doc (`docsRules`) |
+| Conventional Comments, mức độ chặn merge | vùng rủi ro cao của nghiệp vụ |
+
+**Repo bạn KHÔNG nên có**: bản sao `tal`, skill vòng lặp riêng, tài liệu giải
+thích `tal` hoạt động thế nào. Có những thứ đó nghĩa là bạn đang bảo trì một
+nhánh rẽ, và nó sẽ trôi khỏi bản chính mà không ai thấy.
+
+Repo bạn **nên** có đúng bốn thứ: `.claude/agent-loop.json`, ba `policyDocs` chỉ
+chứa phần riêng của stack, workflow CI, và nhãn `agent:ready` do người gắn.
+
+### Sai chiều nào cũng hỏng
+
+Đẩy phần riêng của repo lên plugin là lỗi ngược lại, và nó **tệ hơn**: plugin sẽ
+mang giả định của một kho sang mọi kho khác. Đã trả giá — một hằng số từng ghim
+cứng `dev|main`, nên rào chặn push-thẳng **im lặng không đóng** ở mọi repo đặt
+tên nhánh khác. Một rào im lặng không đóng tệ hơn không có rào.
+
+---
+
+---
+
 ## 1. Cài
 
 ```sh
@@ -449,3 +482,57 @@ Nói rõ để không ai chờ nhầm:
 - **Không** merge khi thiếu một trong hai cổng (review đạt, CI xanh), và không có đường vòng
   nào ngoài `--force` do người gõ.
 - **Không** chạy full suite. Không bao giờ, trong vòng lặp.
+
+---
+
+## 9. Chạy nhiều máy — ghim phiên bản, nếu không khoá vô nghĩa
+
+`tal` là một **khoá phân tán**. Toàn bộ giá trị của nó nằm ở chỗ mọi session
+đồng ý với nhau về "ai đang giữ gì". Hai máy cài hai bản `tal` khác nhau thì:
+
+- mặc định khác `refNamespace` ⇒ **hai session không thấy lease của nhau** ⇒
+  cùng làm một issue — đúng cái duy nhất hệ thống tồn tại để ngăn;
+- khác cách đọc `fullSuite`/`affectedTests` ⇒ rào chặn khác nhau ở hai chỗ;
+- khác hành vi `gc` ⇒ một máy xoá thứ máy kia còn cần.
+
+Plugin cố ý **không có trường `version`** — nó dùng commit SHA làm phiên bản.
+Nên repo bạn phải tự ghi SHA đang dùng, ở **một** chỗ, và có một phép kiểm kêu
+khi lệch. Ghim `main` là không ghim gì: `main` di chuyển, và đã từng bị
+force-push một lần.
+
+Phép kiểm phải chứng minh **cả hai chiều**: xanh khi khớp, **và đỏ khi lệch**.
+Một rào chỉ biết kêu mà không chứng minh được nó biết im thì sẽ bị tắt, và lúc
+đó mất luôn phần canh đúng.
+
+---
+
+## 10. Khi nào KHÔNG nên dùng
+
+Nói trước để khỏi mất thời gian:
+
+| Tình huống | Vì sao không hợp |
+|---|---|
+| Một người, một session | Toàn bộ chi phí lease/fencing/worktree không mua được gì. Dùng git bình thường. |
+| Backlog dưới ~10 issue `ready` mỗi đợt | Lô không đủ lớn để nuốt chi phí một vòng — quay lại đúng cái mô hình lô sinh ra để chữa. |
+| Repo không dùng GitHub Issues | Ledger sống trong comment của issue. Không có issue thì không có sổ. |
+| `gh` không tạo được ref tuỳ ý | Không có compare-and-swap thật ⇒ **không có khoá**. `tal doctor` kiểm điều này; nó đỏ thì đừng chạy nhiều session. |
+| Việc cần một người quyết ở giữa chừng | Vòng lặp tối ưu cho việc chạy hết không cần hỏi. Việc cần hỏi thì mở issue cho người. |
+
+---
+
+## 11. Nhiều repo và submodule
+
+Lô **không được chạm submodule** — pointer submodule là một sha trơ, không mang
+thông tin, nên nhánh chạm nó phải mang số issue trong TÊN để tra ngược được "sha
+này ra từ PR nào". Tên lô không mang được số issue nào.
+
+Gặp trong lô thì gỡ ra rồi làm riêng:
+
+```sh
+tal batch drop <N> --reason "chạm submodule"
+tal claim <N>          # nhánh issue-<số>, ở cả repo chính và repo con
+```
+
+Plugin **không** điều phối được nhiều repo ngang hàng (không phải submodule).
+Hai repo song song là hai backlog, hai `refNamespace`, hai vòng lặp — và nếu một
+thay đổi phải đi qua cả hai thì phần nối vẫn là việc của người.

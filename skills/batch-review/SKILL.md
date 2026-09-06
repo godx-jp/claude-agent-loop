@@ -88,12 +88,14 @@ Rồi đối chiếu từng điểm `(blocking)` vòng trước. Điểm còn s�
 
 - **Tiền và dữ liệu không sửa lại được**: snapshot bất biến bị ghi đè; làm tròn/quy đổi sai
   chỗ; đảo tiền không idempotent theo id sự kiện (webhook giao lại là chuyện thường).
-- **Thời gian nghiệp vụ**: "hôm nay"/biên ca/hạn dùng theo timezone của chi nhánh, không
-  theo đồng hồ app hay đồng hồ DB.
+- **Thời gian nghiệp vụ**: "hôm nay", biên kỳ, hạn dùng — tính theo múi giờ mà **nghiệp vụ**
+  quy định, không theo đồng hồ app hay đồng hồ DB. Múi giờ ấy thuộc về thực thể nào là việc
+  của repo; `policyDocs.review` khai.
 - **Cờ debug/bypass** ghi cứng bật trong file được commit; guard theo môi trường bị nới.
 - **Bí mật / cấu hình của một máy** lọt vào file commit.
-- **Di trú dữ liệu**: đổi schema mà không có migration; `->change()` chỉ test trên SQLite
-  trong khi production là MySQL.
+- **Di trú dữ liệu**: đổi schema mà không có migration; và **engine test khác engine
+  production** — một thay đổi DDL xanh trên engine test vẫn có thể hỏng trên engine thật
+  (hàm, kiểu, ràng buộc không tương đương). Tên hai engine ở `policyDocs.test`.
 - **Thất bại im lặng**: thao tác đổi dữ liệu mà lỗi không đến được người dùng.
 - **Test**: có test chứng minh hành vi mới, và test đó **thật sự chạy** (nằm trong
   testsuite, không phải một thư mục không ai gọi).
