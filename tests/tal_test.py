@@ -68,9 +68,33 @@ REAL = {name: obj for name, obj in vars(tal).items()
         if isinstance(obj, types.FunctionType) or name == "C"}
 
 
+# Rào MẠNG. Bộ test này là test ĐƠN VỊ: không ca nào được đi hỏi GitHub thật.
+#
+# Cổng CI đầu tiên của kho này bắt ngay lượt chạy đầu: `test_2639…` gọi
+# `merge_blockers` mà quên chặn `refs_all`, nên trên máy có `gh` đăng nhập sẵn nó
+# đã lặng lẽ đọc lease refs THẬT của kho — kết quả một bài test phụ thuộc trạng
+# thái sống của repo, và chỉ lộ ra ở chỗ không có token.
+#
+# Rào đặt ở `run` chứ không ở `gh`/`gh_json*`, vì đó là chỗ DUY NHẤT thật sự gọi
+# subprocess. Rào ở tầng trên sinh dương tính giả: một test stub `tal.gh` rồi để
+# `gh_json_strict` thật gọi vào stub ấy thì không có gói tin nào rời máy. Và chỉ
+# chặn `gh` — `git` thì nhiều test chạy thật trên cây tạm, đó là chuyện khác.
+def _rail_run(real):
+    def guarded(cmd, *a, **k):
+        if cmd and cmd[0] == "gh":
+            raise AssertionError(
+                f"bài test chạm MẠNG: `gh {' '.join(cmd[1:5])}…`. Bộ test này là test "
+                f"đơn vị — thay `tal.gh` / `tal.gh_json*` (hoặc hàm gọi chúng, ví dụ "
+                f"`tal.refs_all`) bằng stub. Không chặn thì bài test đo trạng thái sống "
+                f"của repo: xanh trên máy có `gh` đăng nhập, đỏ trên CI.")
+        return real(cmd, *a, **k)
+    return guarded
+
+
 def restore_tal():
     for name, fn in REAL.items():
         setattr(tal, name, fn)
+    tal.run = _rail_run(REAL["run"])
 
 
 FAILURES: list[str] = []
@@ -324,6 +348,9 @@ def test_merge_batch_releases_gate_when_window_raises():
         ]
         tal.merge_blockers = lambda pr, require_ci=False: (900, None, (None, None))
         tal.refs_all = lambda: []          # #2153: lô giờ né PR có review lease sống
+        # Nhánh "cụm repo con chưa xong" comment lên PR thật; bài này đo việc NHẢ
+        # CỔNG, không đo lời bình.
+        tal.gh = lambda args, check=True, stdin=None: None
         tal.batch_gate_acquire = lambda: True
         tal.batch_gate_release = lambda: released.append(1)
         tal.merge_sub_prs = sub_impl
@@ -389,6 +416,10 @@ def test_batch_gate():
 
         # Khoá: session A giành được, session B bị từ chối (không chờ, không xoá gì).
         refs: set[str] = set()
+        # `reap_batch_gate` liệt kê lease refs; sổ giả ở trên mới là nguồn sự thật
+        # của bài này, còn đường thật đi ra mạng.
+        tal.refs_all = lambda: sorted(refs)
+        tal.refs_all_full = lambda: [{"key": k, "sha": "", "type": "commit"} for k in sorted(refs)]
         tal.head_sha = lambda: "0" * 40
         tal.ref_create = lambda k, sha, payload=None: (k not in refs) and (refs.add(k) or True)
         tal.ref_exists = lambda k: k in refs
@@ -3383,6 +3414,10 @@ def test_merge_requires_github_verdict():
     tal.issue_data = lambda n: {"labels": [tal.L_PASSED]}
     tal.pr_issue = lambda pr: 2261
     tal.pr_checks = lambda pr: ("pass", [])
+    # `merge_blockers` hỏi lease refs để biết PR có đang bị session review giữ.
+    # Không chặn thì bài test này đọc lease THẬT của kho — xanh trên máy có `gh`,
+    # đỏ trên CI, và tệ hơn: verdict của nó phụ thuộc kho đang có ai làm gì.
+    tal.refs_all = lambda: []
     tal.pr_verdict_pass_evidence = lambda pr, sha, head_branch=None: (None, None)
     tal.gh_json = lambda args, **k: {
         "state": "OPEN", "isDraft": False, "mergeable": "MERGEABLE",
@@ -4742,6 +4777,10 @@ def _stub_merge_env(why, calls):
     tal.session_id = lambda: "deadbeefcafe0000"
     # Chẩn đoán base đỏ đi ra mạng — test này đo RÀO, không đo chẩn đoán.
     tal.base_red_hint = lambda names: ""
+    # `merge_blockers` hỏi lease refs để biết PR có đang bị session review giữ.
+    # Không chặn thì bài test này đọc lease THẬT của kho — xanh trên máy có `gh`,
+    # đỏ trên CI, và tệ hơn: verdict của nó phụ thuộc kho đang có ai làm gì.
+    tal.refs_all = lambda: []
 
 
 def test_2639_red_ci_refuses_merge_and_force_does_not_open_it():
@@ -4776,6 +4815,7 @@ def test_2639_red_ci_refuses_merge_and_force_does_not_open_it():
     tal.issue_data = lambda n: {"labels": [tal.L_PASSED]}
     tal.pr_verdict_pass_evidence = lambda pr, sha=None, head_branch=None: ("abc123abc123", "9")
     tal.pr_checks = lambda pr: ("fail", ["arch-gate=fail", "web/admin=pass", "pest=skipping"])
+    tal.refs_all = lambda: []          # lease refs: đo THẬT ở đây là chạm mạng
     _, why_red, _ = tal.merge_blockers(42, require_ci=False)
     check(why_red == [tal.CI_RED + "arch-gate"],
           "blocker CI nêu ĐÚNG check đỏ (không bắt người dò `=fail` giữa cả bảng)",
@@ -4929,6 +4969,7 @@ def _stub_pending_blockers_env(rows):
     tal.pr_issue = lambda pr: 1
     tal.issue_data = lambda n: {"labels": [tal.L_PASSED]}
     tal.pr_verdict_pass_evidence = lambda pr, sha=None, head_branch=None: ("abc123abc123", "9")
+    tal.refs_all = lambda: []          # lease refs: đo THẬT ở đây là chạm mạng
 
 
 def test_2669_pending_ci_refuses_merge_and_skipping_is_not_pending():
@@ -5722,6 +5763,10 @@ def test_cmd_queue_actually_wires_the_pr_check_in():
         # Hai issue từ CÙNG một PR cụm — đúng hình dạng đã đẻ ra #2769. Một
         # phần tử chỉ chứng minh dây nối; hai mới chứng minh nó lọc theo map.
         tal.issues_claimed_by_open_prs = lambda: {2754: 2767, 2739: 2767}
+        # `queue_skip_reason` hỏi issue cha qua REST cho TỪNG issue; ba issue giả ở
+        # trên không có cha, và đường thật đi ra mạng.
+        tal.parent_of = lambda n, body=None: None
+        tal.children_of = lambda n, body=None: []
         tal.emit = lambda out, ok: out
 
         out = tal.cmd_queue(A())
@@ -5731,7 +5776,8 @@ def test_cmd_queue_actually_wires_the_pr_check_in():
               "CẢ HAI issue của PR cụm bị loại; issue chưa ai làm vẫn còn — gỡ "
               "đối số `closing_pr` khỏi cmd_queue thì bài này ĐỎ")
     finally:
-        for k in ("refs_all", "open_issues", "issues_claimed_by_open_prs", "emit"):
+        for k in ("refs_all", "open_issues", "issues_claimed_by_open_prs",
+                  "parent_of", "children_of", "emit"):
             setattr(tal, k, REAL[k])
 
 
