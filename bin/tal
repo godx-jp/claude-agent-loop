@@ -7216,11 +7216,49 @@ def cmd_doctor(a):
             check(lb, False, "thiếu — chạy `tal doctor --fix`")
 
     print("\ndọn branch sau merge")
+    # #4160 — CHIỀU CỦA RÀO NÀY PHỤ THUỘC CÓ LUỒNG PROMOTE HAY KHÔNG.
+    #
+    # `delete_branch_on_merge` đúng cho nhánh dùng một lần (`issue-*`, `batch-*`):
+    # merge xong thì nhánh hết việc. Nhưng khi repo có luồng promote, PR phát hành
+    # mang `head = <baseBranch>` — và GitHub không phân biệt hai loại: nó xoá head
+    # branch của MỌI PR được merge. Đã xảy ra thật ở godx-tempo: merge PR promote
+    # `dev → main` lúc 21:38Z và nhánh `dev` BIẾN MẤT.
+    #
+    # Giữa lúc đó `batch claim` (dựng worktree từ origin/<base>), `pr` (mở PR vào
+    # base) và `gc` (fetch base để đo) đều chết, với triệu chứng
+    # `unknown revision origin/dev` — đọc như hỏng cấu hình, không như "có người
+    # vừa xoá nhánh". Cửa sổ kéo dài tới khi có người nhận ra.
+    #
+    # Điều làm nó khó thấy: chính `tal doctor --fix` là thứ BẬT setting ấy. Công cụ
+    # của vòng lặp tự tay bật cái xoá nhánh nền của chính nó.
+    #
+    # Đường thay thế KHÔNG mất khả năng dọn: `delete_merged_branches` trong `gc` đã
+    # xoá branch remote của mọi PR đã merge, và nó BIẾT chừa — `protect` luôn chứa
+    # BASE_BRANCH và PROMOTION_BRANCH. Chủ việc dọn chuyển từ GitHub (không biết gì
+    # về vòng lặp) sang `gc` (biết). Giá phải trả: nhánh sống thêm tới lượt `gc` kế.
+    #
+    # Không có luồng promote (base == promotion) thì không có PR nào mang head là
+    # nhánh sống lâu, nên giữ nguyên chiều cũ.
+    promote_flow = PROMOTION_BRANCH != BASE_BRANCH
     repos = [C.repo] + [s["repo"] for s in submodules().values() if s.get("repo")]
     for r in repos:
         cur = gh_json(["api", f"repos/{r}", "-q", ".delete_branch_on_merge"], default=None)
         if cur is None:
             check(f"{r}", False, "không đọc được (repo đổi tên?)")
+        elif promote_flow:
+            if not cur:
+                check(f"{r} delete_branch_on_merge", True,
+                      f"tắt — đúng: `tal gc` dọn nhánh và chừa {BASE_BRANCH}/{PROMOTION_BRANCH}")
+            elif a.fix:
+                gh(["api", f"repos/{r}", "-X", "PATCH", "-F", "delete_branch_on_merge=false"],
+                   check=False)
+                check(f"{r} delete_branch_on_merge", True,
+                      f"đã TẮT — PR promote mang head={BASE_BRANCH}, bật là xoá nhánh nền (#4160)")
+            else:
+                check(f"{r} delete_branch_on_merge", False,
+                      f"đang BẬT — PR promote {BASE_BRANCH}→{PROMOTION_BRANCH} mang "
+                      f"head={BASE_BRANCH}, nên mỗi lượt phát hành sẽ XOÁ {BASE_BRANCH}. "
+                      f"`tal doctor --fix` để tắt; `tal gc` vẫn dọn nhánh đã merge (#4160)")
         elif cur:
             check(f"{r} delete_branch_on_merge", True)
         elif a.fix:
@@ -7652,7 +7690,7 @@ def main() -> int:
     add("config", cmd_config, "in chính sách repo đã giải (giá trị + NGUỒN của nó)")
 
     p = add("doctor", cmd_doctor, "kiểm tra điều kiện chạy")
-    p.add_argument("--fix", action="store_true", help="tạo nhãn thiếu, bật delete_branch_on_merge")
+    p.add_argument("--fix", action="store_true", help="tạo nhãn thiếu, đặt delete_branch_on_merge đúng chiều (#4160)")
 
     p = add("queue", cmd_queue, "hàng đợi issue cho vai code")
     p.add_argument("--limit", type=int, default=10)
