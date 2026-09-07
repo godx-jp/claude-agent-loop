@@ -3594,6 +3594,28 @@ def head_issue(pr: dict) -> int | None:
     return None
 
 
+CLOSES_RE = re.compile(r"(?mi)^\s*(?:closes|fixes|resolves)\s+#(\d+)\s*$")
+
+
+def closes_in_body(body: str | None) -> set[int]:
+    """Số issue mà thân PR khai đóng — CHỈ dòng đứng riêng, đúng dạng `tal pr` sinh.
+
+    Không nhận `fixes #123` giữa văn xuôi: cùng lý do đã ghi ở `pr_issue` (#2300),
+    một câu trích dẫn từng làm review/merge ghi sổ vào issue của NGƯỜI KHÁC."""
+    return {int(x) for x in CLOSES_RE.findall(body or "")}
+
+
+def default_branch() -> str:
+    """Nhánh MẶC ĐỊNH của repo trên GitHub — thứ duy nhất `Closes #N` tự đóng theo.
+
+    Khác `PROMOTION_BRANCH`: cái kia là đích của `release-to-main` theo CẤU HÌNH,
+    còn cái này là sự thật phía GitHub. Ở repo đặt hai thứ khác nhau, đoán bằng
+    config là đoán sai. Không đọc được thì trả PROMOTION_BRANCH — đường lùi ấy làm
+    phép so ở chỗ gọi im, tức không báo nhầm."""
+    v = gh_json(["api", f"repos/{C.repo}", "-q", ".default_branch"], default=None)
+    return v if isinstance(v, str) and v else PROMOTION_BRANCH
+
+
 def cmd_review_queue(a):
     live = {r["key"]: r for r in refs_all_full()}
     # #2151 — hàng đợi REVIEW: cùng lý do như open_issues().
@@ -6694,6 +6716,32 @@ def cmd_gc(a):
                          "action": "KHÔNG dọn trọn vẹn worktree — xem cảnh báo; nếu đã dời "
                                    "thành orphan thì gc sẽ thử lại, nếu chưa dời thì đăng ký git "
                                    "được giữ nguyên (#2177/#2364)"})
+
+    # `Closes #N` KHÔNG tự đóng issue khi merge vào base — GitHub chỉ tự đóng ở
+    # NHÁNH MẶC ĐỊNH của repo, mà vòng lặp thì nhắm vào `baseBranch`. Khi hai cái
+    # đó khác nhau (dev → main), mọi `Closes` đều im lặng không có tác dụng.
+    #
+    # Với nhánh của vòng lặp thì vòng ở trên đã bù: nó gọi `gh issue close` tay.
+    # Với PR mở NGOÀI vòng lặp (`fix/*`, `feat/*` — người mở) thì KHÔNG AI bù, và
+    # issue nằm lại OPEN sau khi việc đã xong. Đo được hai ca trong một ngày
+    # (#4156, #4165): cả hai đều viết `Closes #N` đúng chuẩn, cả hai đều ở lại mở.
+    #
+    # Ở đây chỉ BÁO, không đóng. Đóng issue của người khác dựa trên suy luận là
+    # hành động một chiều, và `gc` không có cách nào biết PR ấy đã làm xong phần
+    # việc hay mới làm một phần — đúng lý do `tal pr` cố ý không đè `Refs #N`
+    # thành `Closes #N`. Báo là đủ để nó thôi trôi mất.
+    if BASE_BRANCH != default_branch():
+        tracked_issue_ids = {n for n in open_labels}
+        for p in merged_prs:
+            if TRACKED_HEAD.match(p["headRefName"]):
+                continue                      # vòng trên đã lo, kể cả phần đóng
+            for n in sorted(closes_in_body(p.get("body"))):
+                if n in tracked_issue_ids:
+                    acts.append({"issue": n, "pr": p["number"],
+                                 "action": (f"PR #{p['number']} ({p['headRefName']}) đã merge và "
+                                            f"viết `Closes #{n}`, nhưng issue VẪN MỞ — `Closes` chỉ "
+                                            f"tự đóng ở nhánh mặc định ({default_branch()}), không ở "
+                                            f"{BASE_BRANCH}. Đóng tay nếu việc đã xong.")})
 
     # #2788 — nhặt PR mở mà issue không nhãn review/ready (reap đã nuốt). Không
     # đụng issue đang giữ lease sống (session code còn làm trên PR đã mở).

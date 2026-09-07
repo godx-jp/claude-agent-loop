@@ -7039,5 +7039,61 @@ def test_push_rail_asks_the_destination_not_the_spelling():
         tal.BASE_BRANCH, tal.PROMOTION_BRANCH = base, promo
 
 
+def test_gc_reports_closes_that_silently_did_nothing():
+    """`Closes #N` KHÔNG tự đóng issue khi merge vào `baseBranch`.
+
+    GitHub chỉ tự đóng ở NHÁNH MẶC ĐỊNH của repo. Vòng lặp nhắm vào `baseBranch`,
+    nên ở kho có `dev → main` thì MỌI `Closes` trong PR của vòng lặp đều im lặng
+    không có tác dụng.
+
+    Nhánh của vòng lặp được vòng đối chiếu trong `gc` bù bằng `gh issue close` tay.
+    PR mở NGOÀI vòng lặp (`fix/*`, `feat/*`) thì không ai bù — đo được hai ca trong
+    một ngày (#4156, #4165), cả hai viết `Closes #N` đúng chuẩn, cả hai ở lại OPEN
+    sau khi việc đã xong.
+
+    `gc` chỉ BÁO, không đóng: đóng issue của người khác dựa trên suy luận là hành
+    động một chiều, và `gc` không biết PR ấy làm xong hay mới làm một phần — đúng
+    lý do `tal pr` cố ý không đè `Refs #N` thành `Closes #N`.
+    """
+    print("gc báo `Closes` không có tác dụng khi base khác nhánh mặc định")
+
+    # Chỉ dòng ĐỨNG RIÊNG mới tính — `fixes #9` giữa văn xuôi từng làm merge ghi
+    # sổ vào issue của NGƯỜI KHÁC (#2300).
+    check(tal.closes_in_body("Closes #10\nFixes #11\nResolves #12") == {10, 11, 12},
+          "nhận cả ba từ khoá, mỗi dòng một issue")
+    check(tal.closes_in_body("xem thêm fixes #9 trong đoạn này") == set(),
+          "KHÔNG nhận từ khoá nằm giữa văn xuôi")
+    check(tal.closes_in_body(None) == set(), "thân rỗng ⇒ rỗng, không nổ")
+
+    # `default_branch` là sự thật phía GitHub, không phải suy từ config: repo đặt
+    # `promotionBranch` khác nhánh mặc định thì đoán bằng config là đoán sai.
+    saved = tal.gh_json
+    try:
+        tal.gh_json = lambda args, default=None: "trunk"
+        check(tal.default_branch() == "trunk", "đọc default_branch từ GitHub")
+        tal.gh_json = lambda args, default=None: None
+        check(tal.default_branch() == tal.PROMOTION_BRANCH,
+              "không đọc được ⇒ lùi về PROMOTION_BRANCH, tức phép so ở chỗ gọi IM "
+              "thay vì báo nhầm")
+    finally:
+        tal.gh_json = saved
+
+    # Và `gc` phải THẬT SỰ dùng chúng — hằng tồn tại mà không ai gọi thì không rào gì.
+    src = TAL.read_text(encoding="utf-8")
+    blk = src[src.index("def cmd_gc("):]
+    blk = blk[:blk.index("\ndef ", 10)]
+    check("closes_in_body(" in blk and "default_branch()" in blk,
+          "cmd_gc gọi cả hai")
+    check("BASE_BRANCH != default_branch()" in blk,
+          "chỉ báo khi base KHÁC nhánh mặc định — kho một nhánh thì `Closes` chạy đúng, "
+          "báo ở đó là tiếng ồn")
+    seg = blk[blk.index("BASE_BRANCH != default_branch()"):]
+    seg = seg[:seg.index("#2788")]
+    check("issue close" not in seg,
+          "chỉ BÁO, KHÔNG đóng issue của PR mở ngoài vòng lặp")
+    check("TRACKED_HEAD.match" in seg,
+          "bỏ qua nhánh của vòng lặp — vòng đối chiếu ở trên đã lo, kể cả phần đóng")
+
+
 if __name__ == "__main__":
     sys.exit(main())
