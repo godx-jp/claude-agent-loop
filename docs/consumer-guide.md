@@ -69,7 +69,7 @@ Trong repo:
 cp <plugin>/examples/agent-loop.json .claude/agent-loop.json
 $EDITOR .claude/agent-loop.json          # bước 2
 printf '.claude/worktrees/\n.tal-lease.json\n' >> .gitignore
-tal doctor --fix                          # tạo nhãn agent:*, bật delete_branch_on_merge
+tal doctor --fix                          # tạo nhãn agent:*, đặt delete_branch_on_merge đúng chiều
 tal config                                # đọc lại chính sách đã giải
 ```
 
