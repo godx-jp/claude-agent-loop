@@ -7369,6 +7369,8 @@ def danger_re() -> re.Pattern:
 # Cờ của `git push` có NUỐT một tham số đứng sau. Không biết danh sách này thì
 # `git push -o ci.skip origin nhánh` bị đọc thành "remote = ci.skip".
 _PUSH_FLAGS_WITH_VALUE = {"-o", "--push-option", "--receive-pack", "--exec", "--repo"}
+# Chuỗi trong tham số của lệnh khác là DỮ LIỆU; của shell thì là LỆNH.
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
 
 
 def push_targets(cmdline: str) -> list[str] | None:
@@ -7377,33 +7379,55 @@ def push_targets(cmdline: str) -> list[str] | None:
     #4160 vòng 2 — rào cũ khớp CHUỖI CON trên cả dòng lệnh, nên nó chặn oan mọi
     nhánh mang `dev`/`main` như một từ trong tên. Đo được: `git push -u origin
     doctor-stops-deleting-dev` bị từ chối — nhánh của chính bản vá cho #4160.
-    `fix/main-menu-overflow`, `issue-4160-restore-dev` cũng vậy.
+    `fix/main-menu-overflow`, `issue-4160-restore-dev` cũng vậy. Và ca thứ hai,
+    đo ngay sau đó: `gh issue create --body '…git push -u origin …-dev…'` cũng bị
+    chặn — một lệnh KHÔNG push gì cả, chỉ MÔ TẢ lệnh push trong văn bản.
 
     Đó không phải phiền toái nhỏ, và file này đã tự nói ra ở `strip_heredocs`:
     "rào báo OAN thì bị TẮT, không bị tranh luận". Một rào an toàn báo oan đúng
     vào lúc người ta đang sửa chính nó là rào sẽ bị gỡ.
 
-    Nên hỏi đúng câu hỏi: đích của refspec là gì. `a:b` đẩy vào `b`; `a` trần đẩy
-    vào `a`; không refspec nào thì đích là nhánh đang đứng, trả `HEAD` cho chỗ gọi
-    tự giải. Không phân tích được thì trả None và chỗ gọi lùi về regex cũ —
-    fail-closed: thà chặn oan còn hơn để lọt một lệnh push thật.
+    Nên hỏi đúng hai câu hỏi, theo thứ tự:
+
+    1. Đoạn này có PHẢI là `git` không? Chuỗi trong tham số của một lệnh khác
+       (`gh issue create --body`, `git commit -m`) là DỮ LIỆU, không phải lệnh.
+       Ngoại lệ là shell: `bash -lc "<lệnh>"` thì phần trong nháy ĐÚNG là lệnh,
+       nên đi vào trong mà đọc tiếp.
+    2. Refspec đẩy vào đâu? `a:b` vào `b`; `a` trần vào `a`; không refspec nào thì
+       đích là nhánh đang đứng — trả `HEAD` cho chỗ gọi tự giải.
+
+    Không phân tích được thì trả None và chỗ gọi lùi về regex cũ — fail-closed:
+    thà chặn oan còn hơn để lọt một lệnh push thật.
     """
     import shlex
     targets: list[str] = []
-    for part in re.split(r"&&|\|\||;|\||\n", cmdline):
-        if not re.search(r"\bgit\b.*\bpush\b", part):
-            continue
+    for part in re.split(r"&&|\|\||;|\n", cmdline):
         try:
             toks = shlex.split(part)
         except ValueError:
             return None
-        if "push" not in toks:
-            return None
+        # `FOO=1 git push …` — bỏ phần gán biến môi trường đứng đầu.
+        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks = toks[1:]
+        if not toks:
+            continue
+        argv0 = os.path.basename(toks[0])
+        if argv0 in _SHELLS:
+            for j, t in enumerate(toks):
+                if t.startswith("-") and "c" in t and j + 1 < len(toks):
+                    inner = push_targets(toks[j + 1])
+                    if inner is None:
+                        return None
+                    targets += inner
+                    break
+            continue
+        if argv0 != "git" or "push" not in toks:
+            continue
         rest = toks[toks.index("push") + 1:]
         args, i, delete = [], 0, False
         while i < len(rest):
             t = rest[i]
-            if t == "--delete" or t == "-d":
+            if t in ("--delete", "-d"):
                 delete = True
             elif t in _PUSH_FLAGS_WITH_VALUE:
                 i += 1
@@ -7412,12 +7436,9 @@ def push_targets(cmdline: str) -> list[str] | None:
             else:
                 args.append(t)
             i += 1
-        if not args:
-            targets.append("HEAD")          # `git push` trần: đích = nhánh đang đứng
-            continue
         specs = args[1:]                    # args[0] là remote
         if not specs:
-            targets.append("HEAD")
+            targets.append("HEAD")          # `git push` trần: đích = nhánh đang đứng
             continue
         for sp in specs:
             dst = sp.split(":", 1)[1] if ":" in sp else sp

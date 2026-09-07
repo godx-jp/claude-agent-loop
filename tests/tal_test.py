@@ -7001,9 +7001,14 @@ def test_push_rail_asks_the_destination_not_the_spelling():
             "git push -u origin doctor-stops-deleting-dev",   # ca đã đo được
             "git push origin fix/main-menu-overflow",
             "git push origin issue-4160-restore-dev",
-            "git push -o ci.skip origin my-dev-branch",       # cờ nuốt tham số
+            "git push -o ci.skip origin my-dev-branch",       # cờ NUỐT tham số
             "git add -A && git commit -m x && git push origin batch-20260907-0431",
             "git push --force-with-lease=dev:abc origin issue-9",
+            # Ca thứ hai, đo ngay sau ca đầu: một lệnh KHÔNG push gì cả, chỉ MÔ TẢ
+            # lệnh push trong văn bản. Chuỗi trong tham số của lệnh khác là DỮ LIỆU.
+            "gh issue create -R o/r --title x --body 'chạy git push -u origin abc-dev rồi thôi'",
+            "git commit -m 'mô tả: git push origin dev bị chặn'",
+            "bash -lc 'git push origin issue-9'",
         ]
         chan = [
             "git push origin dev",
@@ -7011,6 +7016,10 @@ def test_push_rail_asks_the_destination_not_the_spelling():
             "git push origin HEAD:main",
             "git push -f origin issue-1:dev",                 # đích nằm SAU dấu hai chấm
             "git push origin refs/heads/dev",
+            # Ngoại lệ của luật "chuỗi là dữ liệu": với SHELL thì phần trong nháy
+            # đúng là lệnh, nên phải đi vào trong mà đọc tiếp.
+            "bash -lc 'git push origin dev'",
+            "GIT_TRACE=1 git push origin main",               # gán biến đứng đầu
         ]
         for c in cho:
             check(not tal.pushes_to_protected(c), f"CHO: {c}")
