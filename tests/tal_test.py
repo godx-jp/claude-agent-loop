@@ -516,7 +516,8 @@ def test_gc_labels_shipped_without_worktree():
 
         def fake_gh_json(args, default=None):
             if args[:2] == ["pr", "list"] and "merged" in args:
-                return [{"number": 900, "headRefName": "issue-77", "closingIssuesReferences": []}]
+                return [{"number": 900, "headRefName": "issue-77",
+                         "closingIssuesReferences": [], "body": ""}]
             if args[:2] == ["pr", "list"]:
                 return []
             return default
@@ -2769,7 +2770,7 @@ def test_gc_calls_a_worktree_corpse_a_corpse_not_uncommitted_work():
 
         def fake_gh_json(args, default=None):
             if args[:2] == ["pr", "list"] and "merged" in args:
-                return [{"number": 900, "headRefName": "issue-77",
+                return [{"number": 900, "headRefName": "issue-77", "body": "",
                          "closingIssuesReferences": [], "mergedAt": "2026-08-08T00:00:00Z"}]
             return [] if args[:2] == ["pr", "list"] else default
 
@@ -4128,7 +4129,10 @@ def _gc_abandoned_harness(*, keep_reason, remote_branch=True, worktree=False):
 
     def fake_gh_json(args, default=None):
         if "--state" in args and "closed" in args:
-            return [{"number": 42, "headRefName": "issue-2993", "mergedAt": None}]
+            # `body` có mặt vì `gh pr list --json` thật có xin nó (#4163) — fixture
+            # thiếu trường mà mã thật đọc thì bài test xanh cho một hình dạng dữ liệu
+            # không tồn tại ngoài đời.
+            return [{"number": 42, "headRefName": "issue-2993", "mergedAt": None, "body": ""}]
         return [] if isinstance(default, list) else (default or [])
 
     # `cmd_gc` hỏi git thật cho `main_worktree`; stub `run` trả rỗng nên phải
@@ -4149,8 +4153,10 @@ def _gc_abandoned_harness(*, keep_reason, remote_branch=True, worktree=False):
     tal.branch_exists_local = lambda br: False
     tal.worktree_paths_for_issue = lambda i: ([tal.C.worktrees_dir / f"issue-{i}"]
                                               if worktree else [])
+    tal.worktree_paths_for_branch = lambda br: ([tal.C.worktrees_dir / br]
+                                                if worktree else [])
     tal.worktree_unmerged_content = lambda *a, **k: keep_reason
-    tal.remove_worktree = lambda i: True
+    tal.remove_worktree = lambda x: True
 
     class A:
         dry_run = False
@@ -6763,6 +6769,64 @@ def test_batch_pr_gates_exist():
           "chặn lô chạm submodule — pointer là sha trơ, tên lô không mang số issue")
     check("batch drop" in body,
           "mỗi cổng chỉ ĐƯỜNG RA cụ thể, không chỉ từ chối")
+
+
+def test_batch_prs_are_visible_to_every_downstream_command():
+    """#4163 — PR của một LÔ phải lọt qua MỌI cửa phía sau `tal pr`.
+
+    Đo trên PR thật: `review-queue` trả "hàng đợi rỗng THẬT" trong khi một PR đang mở,
+    mang đúng nhãn `agent:awaiting-review`, chờ người review. Bốn lệnh lọc head bằng
+    `^issue-\\d+$` viết tay — mỗi chỗ một bản — nên nhánh `batch-<…>` bị bỏ qua IM LẶNG.
+
+    Vòng lặp tạo ra việc mà không gì phía sau nhìn thấy. Không đỏ, không cảnh báo: đúng
+    lớp lỗi tệ nhất, vì nó trông y hệt "không có việc nào".
+    """
+    print("PR của lô phải nhìn thấy được ở review-queue / merge-queue / merge-batch / gc")
+
+    check(bool(tal.TRACKED_HEAD.match("batch-20260907-0431")),
+          "TRACKED_HEAD nhận nhánh lô")
+    check(bool(tal.TRACKED_HEAD.match("issue-4127")),
+          "TRACKED_HEAD vẫn nhận nhánh issue đơn")
+    for bad in ("main", "dev", "feat/x", "batch-abc", "batch-2026-09"):
+        check(not tal.TRACKED_HEAD.match(bad), f"TRACKED_HEAD từ chối {bad!r}")
+
+    # Rào chống TÁI PHÁT: chỉ được còn MỘT chỗ khoá cứng `^issue-\\d+$` — `BRANCH_RE`,
+    # dùng cho LUẬT TÊN NHÁNH (nơi nhánh đơn thật sự là dạng duy nhất hợp lệ trong
+    # submodule). Mọi chỗ LỌC PR theo head phải đi qua `TRACKED_HEAD`.
+    src = TAL.read_text(encoding="utf-8")
+    hard = src.count('re.compile(r"^issue-\\d+$")')
+    check(hard == 1,
+          f"chỉ MỘT chỗ khoá cứng ^issue-<số>$ (BRANCH_RE); đếm được {hard}",
+          "thêm một bản sao nữa là dựng lại đúng bug #4163")
+    check('re.match(r"^issue-\\d+$", p["headRefName"])' not in src,
+          "không chỗ nào lọc head PR bằng regex viết tay nữa")
+
+    # Và mỗi lệnh phía sau phải THẬT SỰ dùng nó — không đủ nếu hằng tồn tại mà không ai gọi.
+    for fn in ("cmd_review_queue", "cmd_merge_queue", "cmd_merge_batch", "cmd_gc"):
+        body = src[src.index(f"def {fn}("):]
+        body = body[:body.index("\ndef ")]
+        check("TRACKED_HEAD" in body, f"{fn} lọc head qua TRACKED_HEAD")
+
+    # Cửa THỨ HAI của cùng một bug: lọt được bộ lọc rồi, `review-queue` vẫn suy số issue
+    # bằng cách CẮT tên nhánh — `batch-20260907-0431`.split("-")[1] = 20260907 — rồi đi
+    # hỏi GitHub về issue #20260907. `head_issue` đọc dòng `Closes #N` trong THÂN PR thay
+    # cho phép cắt ấy, nên mọi `gh pr list` cấp dữ liệu cho nó BẮT BUỘC phải xin `body`:
+    # thiếu trường này thì hàm đọc chuỗi rỗng và trả None — lô lại vô hình, im lặng y hệt.
+    check('int(p["headRefName"].split("-")[1])' not in src,
+          "không chỗ nào suy số issue bằng cách cắt tên nhánh nữa")
+    try:
+        tal.head_issue({"number": 9, "headRefName": "batch-20260907-0431"})
+        check(False, "bản ghi PR thiếu `body` phải NỔ, không được trả None")
+    except tal.Fail as e:
+        check("body" in str(e), "lỗi nói thẳng trường nào thiếu và sửa ở đâu")
+
+    pr = {"headRefName": "batch-20260907-0431",
+          "body": "Gom lô.\n\nCloses #4127\nCloses #4128\n"}
+    check(tal.head_issue(pr) == 4127, "head_issue đọc được issue neo của PR lô")
+    check(tal.head_issue({"headRefName": "issue-4127", "body": ""}) == 4127,
+          "head_issue vẫn ưu tiên tên nhánh issue đơn")
+    check(tal.head_issue({"headRefName": "batch-20260907-0431", "body": ""}) is None,
+          "PR lô không có dòng Closes thì trả None, không đoán bừa")
 
 
 if __name__ == "__main__":
