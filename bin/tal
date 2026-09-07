@@ -7216,11 +7216,49 @@ def cmd_doctor(a):
             check(lb, False, "thiếu — chạy `tal doctor --fix`")
 
     print("\ndọn branch sau merge")
+    # #4160 — CHIỀU CỦA RÀO NÀY PHỤ THUỘC CÓ LUỒNG PROMOTE HAY KHÔNG.
+    #
+    # `delete_branch_on_merge` đúng cho nhánh dùng một lần (`issue-*`, `batch-*`):
+    # merge xong thì nhánh hết việc. Nhưng khi repo có luồng promote, PR phát hành
+    # mang `head = <baseBranch>` — và GitHub không phân biệt hai loại: nó xoá head
+    # branch của MỌI PR được merge. Đã xảy ra thật ở godx-tempo: merge PR promote
+    # `dev → main` lúc 21:38Z và nhánh `dev` BIẾN MẤT.
+    #
+    # Giữa lúc đó `batch claim` (dựng worktree từ origin/<base>), `pr` (mở PR vào
+    # base) và `gc` (fetch base để đo) đều chết, với triệu chứng
+    # `unknown revision origin/dev` — đọc như hỏng cấu hình, không như "có người
+    # vừa xoá nhánh". Cửa sổ kéo dài tới khi có người nhận ra.
+    #
+    # Điều làm nó khó thấy: chính `tal doctor --fix` là thứ BẬT setting ấy. Công cụ
+    # của vòng lặp tự tay bật cái xoá nhánh nền của chính nó.
+    #
+    # Đường thay thế KHÔNG mất khả năng dọn: `delete_merged_branches` trong `gc` đã
+    # xoá branch remote của mọi PR đã merge, và nó BIẾT chừa — `protect` luôn chứa
+    # BASE_BRANCH và PROMOTION_BRANCH. Chủ việc dọn chuyển từ GitHub (không biết gì
+    # về vòng lặp) sang `gc` (biết). Giá phải trả: nhánh sống thêm tới lượt `gc` kế.
+    #
+    # Không có luồng promote (base == promotion) thì không có PR nào mang head là
+    # nhánh sống lâu, nên giữ nguyên chiều cũ.
+    promote_flow = PROMOTION_BRANCH != BASE_BRANCH
     repos = [C.repo] + [s["repo"] for s in submodules().values() if s.get("repo")]
     for r in repos:
         cur = gh_json(["api", f"repos/{r}", "-q", ".delete_branch_on_merge"], default=None)
         if cur is None:
             check(f"{r}", False, "không đọc được (repo đổi tên?)")
+        elif promote_flow:
+            if not cur:
+                check(f"{r} delete_branch_on_merge", True,
+                      f"tắt — đúng: `tal gc` dọn nhánh và chừa {BASE_BRANCH}/{PROMOTION_BRANCH}")
+            elif a.fix:
+                gh(["api", f"repos/{r}", "-X", "PATCH", "-F", "delete_branch_on_merge=false"],
+                   check=False)
+                check(f"{r} delete_branch_on_merge", True,
+                      f"đã TẮT — PR promote mang head={BASE_BRANCH}, bật là xoá nhánh nền (#4160)")
+            else:
+                check(f"{r} delete_branch_on_merge", False,
+                      f"đang BẬT — PR promote {BASE_BRANCH}→{PROMOTION_BRANCH} mang "
+                      f"head={BASE_BRANCH}, nên mỗi lượt phát hành sẽ XOÁ {BASE_BRANCH}. "
+                      f"`tal doctor --fix` để tắt; `tal gc` vẫn dọn nhánh đã merge (#4160)")
         elif cur:
             check(f"{r} delete_branch_on_merge", True)
         elif a.fix:
@@ -7320,9 +7358,109 @@ PUSH_RE = re.compile(r"\bgit\s+push\b|\bgh\s+pr\s+create\b")
 def danger_re() -> re.Pattern:
     """Push thẳng vào base/promotion. Dựng theo CONFIG, không ghi cứng `dev|main`:
     tên nhánh ghi cứng ở đây là một rào IM LẶNG KHÔNG ĐÓNG ở mọi repo đặt tên khác,
-    và rào im lặng không đóng thì tệ hơn không có rào."""
+    và rào im lặng không đóng thì tệ hơn không có rào.
+
+    CHỈ còn là đường LÙI của `push_targets` (xem ở dưới) — nó khớp chuỗi con nên
+    báo oan với mọi nhánh có `dev`/`main` làm một từ trong tên."""
     names = "|".join(re.escape(x) for x in {BASE_BRANCH, PROMOTION_BRANCH} if x)
     return re.compile(rf"\bgit\s+push\b.*\b(origin\s+)?({names})\b")
+
+
+# Cờ của `git push` có NUỐT một tham số đứng sau. Không biết danh sách này thì
+# `git push -o ci.skip origin nhánh` bị đọc thành "remote = ci.skip".
+_PUSH_FLAGS_WITH_VALUE = {"-o", "--push-option", "--receive-pack", "--exec", "--repo"}
+# Chuỗi trong tham số của lệnh khác là DỮ LIỆU; của shell thì là LỆNH.
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh"}
+
+
+def push_targets(cmdline: str) -> list[str] | None:
+    """Nhánh ĐÍCH của mọi `git push` trong `cmdline`; `None` = không phân tích được.
+
+    #4160 vòng 2 — rào cũ khớp CHUỖI CON trên cả dòng lệnh, nên nó chặn oan mọi
+    nhánh mang `dev`/`main` như một từ trong tên. Đo được: `git push -u origin
+    doctor-stops-deleting-dev` bị từ chối — nhánh của chính bản vá cho #4160.
+    `fix/main-menu-overflow`, `issue-4160-restore-dev` cũng vậy. Và ca thứ hai,
+    đo ngay sau đó: `gh issue create --body '…git push -u origin …-dev…'` cũng bị
+    chặn — một lệnh KHÔNG push gì cả, chỉ MÔ TẢ lệnh push trong văn bản.
+
+    Đó không phải phiền toái nhỏ, và file này đã tự nói ra ở `strip_heredocs`:
+    "rào báo OAN thì bị TẮT, không bị tranh luận". Một rào an toàn báo oan đúng
+    vào lúc người ta đang sửa chính nó là rào sẽ bị gỡ.
+
+    Nên hỏi đúng hai câu hỏi, theo thứ tự:
+
+    1. Đoạn này có PHẢI là `git` không? Chuỗi trong tham số của một lệnh khác
+       (`gh issue create --body`, `git commit -m`) là DỮ LIỆU, không phải lệnh.
+       Ngoại lệ là shell: `bash -lc "<lệnh>"` thì phần trong nháy ĐÚNG là lệnh,
+       nên đi vào trong mà đọc tiếp.
+    2. Refspec đẩy vào đâu? `a:b` vào `b`; `a` trần vào `a`; không refspec nào thì
+       đích là nhánh đang đứng — trả `HEAD` cho chỗ gọi tự giải.
+
+    Không phân tích được thì trả None và chỗ gọi lùi về regex cũ — fail-closed:
+    thà chặn oan còn hơn để lọt một lệnh push thật.
+    """
+    import shlex
+    targets: list[str] = []
+    for part in re.split(r"&&|\|\||;|\n", cmdline):
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            return None
+        # `FOO=1 git push …` — bỏ phần gán biến môi trường đứng đầu.
+        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks = toks[1:]
+        if not toks:
+            continue
+        argv0 = os.path.basename(toks[0])
+        if argv0 in _SHELLS:
+            for j, t in enumerate(toks):
+                if t.startswith("-") and "c" in t and j + 1 < len(toks):
+                    inner = push_targets(toks[j + 1])
+                    if inner is None:
+                        return None
+                    targets += inner
+                    break
+            continue
+        if argv0 != "git" or "push" not in toks:
+            continue
+        rest = toks[toks.index("push") + 1:]
+        args, i, delete = [], 0, False
+        while i < len(rest):
+            t = rest[i]
+            if t in ("--delete", "-d"):
+                delete = True
+            elif t in _PUSH_FLAGS_WITH_VALUE:
+                i += 1
+            elif t.startswith("-"):
+                pass
+            else:
+                args.append(t)
+            i += 1
+        specs = args[1:]                    # args[0] là remote
+        if not specs:
+            targets.append("HEAD")          # `git push` trần: đích = nhánh đang đứng
+            continue
+        for sp in specs:
+            dst = sp.split(":", 1)[1] if ":" in sp else sp
+            dst = dst.lstrip("+").removeprefix("refs/heads/")
+            targets.append(dst or ("" if delete else "HEAD"))
+    return targets
+
+
+def pushes_to_protected(cmdline: str) -> bool:
+    """`cmdline` có đẩy thẳng vào base/promotion không."""
+    tg = push_targets(cmdline)
+    if tg is None:
+        return bool(danger_re().search(cmdline))     # không đo được ⇒ chặn như cũ
+    protected = {x for x in (BASE_BRANCH, PROMOTION_BRANCH) if x}
+    for t in tg:
+        if t == "HEAD":
+            cur = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False).stdout.strip()
+            if cur in protected:
+                return True
+        elif t in protected:
+            return True
+    return False
 
 
 DANGER_RE = danger_re()
@@ -7607,7 +7745,7 @@ def cmd_hook_guard(a):
                         f"`{PROMOTION_BRANCH}`."
                     )
 
-        if danger_re().search(cmdline):
+        if pushes_to_protected(cmdline):
             where = f" từ worktree issue #{context[1]['issue']}" if context else ""
             deny(f"[tal] Không push thẳng vào {BASE_BRANCH}/{PROMOTION_BRANCH}{where}. "
                  f"Dùng `tal pr` để mở PR vào {BASE_BRANCH}.")
@@ -7652,7 +7790,7 @@ def main() -> int:
     add("config", cmd_config, "in chính sách repo đã giải (giá trị + NGUỒN của nó)")
 
     p = add("doctor", cmd_doctor, "kiểm tra điều kiện chạy")
-    p.add_argument("--fix", action="store_true", help="tạo nhãn thiếu, bật delete_branch_on_merge")
+    p.add_argument("--fix", action="store_true", help="tạo nhãn thiếu, đặt delete_branch_on_merge đúng chiều (#4160)")
 
     p = add("queue", cmd_queue, "hàng đợi issue cho vai code")
     p.add_argument("--limit", type=int, default=10)

@@ -6936,5 +6936,108 @@ def test_setup_runs_once_per_worktree_and_fails_as_a_broken_gate():
         check(not marker.exists(), "dựng trượt ⇒ KHÔNG ghi dấu")
 
 
+def test_4160_doctor_does_not_enable_the_setting_that_deletes_the_base_branch():
+    """#4160 — `tal doctor --fix` từng BẬT `delete_branch_on_merge`, và chính setting
+    ấy xoá nhánh nền ở lượt promote.
+
+    Đã xảy ra thật ở godx-tempo: merge PR promote `dev → main` lúc 21:38Z, GitHub xoá
+    luôn `dev`. Giữa lúc đó `batch claim`, `pr`, `gc` đều chết với `unknown revision
+    origin/dev` — đọc như hỏng cấu hình, không như "có người vừa xoá nhánh".
+
+    Khả năng dọn KHÔNG mất: `delete_merged_branches` trong `gc` vẫn xoá branch của PR
+    đã merge, và `protect` của nó luôn chứa BASE_BRANCH + PROMOTION_BRANCH — nên chủ
+    việc dọn chuyển từ GitHub (không biết gì) sang `gc` (biết chừa nhánh nào).
+    """
+    print("#4160 doctor không được bật cái xoá nhánh nền, và gc vẫn chừa nó")
+
+    src = TAL.read_text(encoding="utf-8")
+
+    # (1) `gc` chừa CẢ HAI nhánh sống lâu — đó là thứ cho phép tắt setting kia mà
+    # không mất khả năng dọn. Ghi cứng "main/dev/master" thôi là không đủ: kho đặt
+    # tên `trunk`/`develop` thì rào im lặng không đóng.
+    blk = src[src.index("def cmd_gc("):]
+    blk = blk[:blk.index("\ndef ", 10)]
+    protect = blk[blk.index("protect = "):]
+    protect = protect[:protect.index("\n\n")]
+    check("BASE_BRANCH" in protect and "PROMOTION_BRANCH" in protect,
+          "`gc` chừa BASE_BRANCH và PROMOTION_BRANCH theo cấu hình, không ghi cứng tên",
+          protect[:120])
+
+    # (2) doctor: có luồng promote ⇒ chiều đúng là TẮT.
+    doc = src[src.index("def cmd_doctor("):]
+    doc = doc[:doc.index("\ndef ", 10)]
+    check("promote_flow = PROMOTION_BRANCH != BASE_BRANCH" in doc,
+          "doctor phân biệt kho CÓ luồng promote với kho không có")
+    check("delete_branch_on_merge=false" in doc,
+          "`--fix` có đường TẮT setting — trước đây chỉ có đường bật")
+    seg = doc[doc.index("promote_flow = "):]
+    on_idx, off_idx = seg.index("delete_branch_on_merge=false"), seg.index("delete_branch_on_merge=true")
+    check(on_idx < off_idx,
+          "nhánh promote (tắt) đứng TRƯỚC nhánh không-promote (bật) — đọc đúng thứ tự "
+          "thì nhánh nguy hiểm được xử lý trước")
+    check("#4160" in doc, "doctor dẫn số issue để người đọc tra được vì sao")
+
+
+def test_push_rail_asks_the_destination_not_the_spelling():
+    """#4160 vòng 2 — rào push khớp CHUỖI CON, nên nó chặn oan mọi nhánh có
+    `dev`/`main` làm một từ trong tên.
+
+    Đo được ngay lúc sửa #4160: `git push -u origin doctor-stops-deleting-dev` bị từ
+    chối — nhánh của chính bản vá ấy. `\bdev\b` khớp phần đuôi vì `-` là ranh giới từ.
+
+    File này đã tự nói ra hậu quả ở `strip_heredocs`: "rào báo OAN thì bị TẮT, không
+    bị tranh luận". Một rào an toàn báo oan đúng vào lúc người ta đang sửa chính nó
+    là rào sẽ bị gỡ — nên đây không phải phiền toái nhỏ, nó là lỗi của rào.
+
+    Câu hỏi đúng không phải "dòng lệnh có chứa chữ dev không" mà "refspec đẩy vào
+    nhánh nào".
+    """
+    print("rào push hỏi ĐÍCH của refspec, không hỏi cách VIẾT dòng lệnh")
+
+    base, promo = tal.BASE_BRANCH, tal.PROMOTION_BRANCH
+    tal.BASE_BRANCH, tal.PROMOTION_BRANCH = "dev", "main"
+    try:
+        cho = [
+            "git push -u origin doctor-stops-deleting-dev",   # ca đã đo được
+            "git push origin fix/main-menu-overflow",
+            "git push origin issue-4160-restore-dev",
+            "git push -o ci.skip origin my-dev-branch",       # cờ NUỐT tham số
+            "git add -A && git commit -m x && git push origin batch-20260907-0431",
+            "git push --force-with-lease=dev:abc origin issue-9",
+            # Ca thứ hai, đo ngay sau ca đầu: một lệnh KHÔNG push gì cả, chỉ MÔ TẢ
+            # lệnh push trong văn bản. Chuỗi trong tham số của lệnh khác là DỮ LIỆU.
+            "gh issue create -R o/r --title x --body 'chạy git push -u origin abc-dev rồi thôi'",
+            "git commit -m 'mô tả: git push origin dev bị chặn'",
+            "bash -lc 'git push origin issue-9'",
+        ]
+        chan = [
+            "git push origin dev",
+            "git push origin main",
+            "git push origin HEAD:main",
+            "git push -f origin issue-1:dev",                 # đích nằm SAU dấu hai chấm
+            "git push origin refs/heads/dev",
+            # Ngoại lệ của luật "chuỗi là dữ liệu": với SHELL thì phần trong nháy
+            # đúng là lệnh, nên phải đi vào trong mà đọc tiếp.
+            "bash -lc 'git push origin dev'",
+            "GIT_TRACE=1 git push origin main",               # gán biến đứng đầu
+        ]
+        for c in cho:
+            check(not tal.pushes_to_protected(c), f"CHO: {c}")
+        for c in chan:
+            check(tal.pushes_to_protected(c), f"CHẶN: {c}")
+
+        # Không phân tích được ⇒ LÙI về regex cũ, không nhả. Rào an toàn mà "không đo
+        # được" thành "cho qua" là đúng lớp lỗi #2300 đã chữa ở khắp nơi khác.
+        saved = tal.push_targets
+        tal.push_targets = lambda cmd: None
+        try:
+            check(tal.pushes_to_protected("git push origin dev"),
+                  "không phân tích được ⇒ vẫn chặn (fail-closed)")
+        finally:
+            tal.push_targets = saved
+    finally:
+        tal.BASE_BRANCH, tal.PROMOTION_BRANCH = base, promo
+
+
 if __name__ == "__main__":
     sys.exit(main())
