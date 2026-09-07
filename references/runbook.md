@@ -148,9 +148,20 @@ buộc: đây là một quyết định của người, và nó được ghi l�
 **Lối thoát.** Commit vẫn còn trong worktree cục bộ. Merge base vào nhánh, push lại, mở PR
 mới.
 
-**Cách để không gặp lại.** Bật `delete_branch_on_merge` ở cấp repo, rồi bỏ hẳn
-`--delete-branch` — cái bẫy này biến mất. Và đi qua `tal merge` thay vì `gh pr merge`: nó
-merge **trần** trước, xoá nhánh remote sau, đúng thứ tự ấy vì lý do này.
+**Cách để không gặp lại.** Đi qua `tal merge` thay vì `gh pr merge`: nó merge **trần**
+trước, xoá nhánh remote sau — đúng thứ tự ấy vì lý do này. Bỏ hẳn `--delete-branch` khỏi
+lệnh gõ tay.
+
+**KHÔNG dùng `delete_branch_on_merge` ở kho có luồng promote** (bản trước của mục này
+khuyên như thế, và nó sai). PR phát hành mang `head = <baseBranch>`, còn GitHub thì xoá
+head branch của **mọi** PR được merge: merge một lượt promote là mất luôn nhánh nền. Đã
+xảy ra ở godx-tempo — nhánh `dev` biến mất lúc `21:38Z`, và `batch claim` / `pr` / `gc`
+chết theo với `unknown revision origin/dev`, một triệu chứng đọc như hỏng cấu hình.
+
+Việc dọn nhánh thuộc về `tal gc`: `protect` của nó chứa `baseBranch` + `promotionBranch`
+theo **cấu hình**, nên nó biết chừa cái GitHub không biết. `tal doctor` đo đúng chiều này
+từ `d40b5ea` — ở kho có promote, nó báo `delete_branch_on_merge` đang BẬT là **vấn đề**,
+và `--fix` tắt nó.
 
 ## §7. Cổng merge báo "full suite ĐỎ" trong khi môi trường lành
 
