@@ -270,6 +270,19 @@ CONVENTIONAL = re.compile(
 # nếu còn commit không map được về đúng một issue của lô. Nhờ đó `tal batch drop`
 # gỡ được đúng phần việc của một issue mà không đụng phần còn lại.
 BRANCH_RE = re.compile(r"^issue-\d+$")
+
+# Branch mà vòng lặp QUẢN — dùng ở mọi chỗ lọc PR theo head.
+#
+# #4163 đo được: bốn lệnh (`review-queue`, `merge-queue`, `merge-batch`, `gc`) lọc
+# head bằng `^issue-\d+$` viết tay, mỗi chỗ một bản. Khi đơn vị công việc thành LÔ,
+# `tal pr` mở PR từ `batch-<YYYYMMDD-HHMM>` — và cả bốn chỗ ấy IM LẶNG bỏ qua nó.
+#
+# Hệ quả đo trên PR thật: `tal review-queue` trả "hàng đợi rỗng THẬT" trong khi một
+# PR đang mở, mang đúng nhãn `agent:awaiting-review`, chờ người review. Vòng lặp tạo
+# ra việc mà không gì phía sau NHÌN THẤY — không đỏ, không cảnh báo.
+#
+# Bốn bản sao của một luật là cách chúng trôi khỏi nhau. Một hằng, bốn chỗ dùng.
+TRACKED_HEAD = re.compile(r"^(issue-\d+|batch-\d{8}-\d{4})$")
 BATCH_RE = re.compile(r"^batch-\d{8}-\d{4}$")
 
 
@@ -2775,8 +2788,8 @@ def worktree_paths_for_branch(want: str) -> list[Path]:
     return found
 
 
-def remove_worktree(issue: int) -> bool:
-    """Xoá worktree của một issue — KHÔNG tin `git worktree remove`.
+def remove_worktree(issue_or_branch: int | str) -> bool:
+    """Xoá worktree của một nhánh — KHÔNG tin `git worktree remove`.
 
     Cùng hình dạng lỗi đã sửa ở `drop_batch_worktree` (#1355), nhưng chỗ này bị
     bỏ sót: `remove --force` từ chối trong đúng những ca cây dễ nặng nhất
@@ -2798,8 +2811,14 @@ def remove_worktree(issue: int) -> bool:
     hại vì tên nó tự khai là rác. Không dời được thì GIỮ NGUYÊN đăng ký (không
     prune, không xoá branch) và trả False — worktree nửa-chết tệ hơn worktree
     chưa dọn.
+    #4163 — nhận CẢ tên nhánh, không chỉ số issue. Nhánh lô `batch-<id>` không mang
+    số issue trong tên, nên bản cũ dựng `issue-{n}` rồi đi dọn một đường dẫn KHÔNG
+    TỒN TẠI và trả True: `tal gc` in "xoá worktree + branch cục bộ (PR đã merge)"
+    trong khi cây lô còn nguyên trên đĩa, mãi không hội tụ — đúng cái #1349 đã chữa
+    một lần, tái phát qua một loại nhánh thứ hai.
     """
-    paths = worktree_paths_for_issue(issue)
+    br = issue_or_branch if isinstance(issue_or_branch, str) else f"issue-{issue_or_branch}"
+    paths = worktree_paths_for_branch(br)
     root = str(C.main_worktree)
     cleaned = True
     for path in paths:
@@ -2815,7 +2834,7 @@ def remove_worktree(issue: int) -> bool:
         except OSError:
             hits_main = path == C.main_worktree
         if hits_main:
-            print(f"  ⚠️ #{issue}: branch issue-{issue} đang checkout ở CÂY CHÍNH "
+            print(f"  ⚠️ {br}: branch đang checkout ở CÂY CHÍNH "
                   f"{path} — tal KHÔNG xoá cây chính (#2782 vòng 2). Chuyển cây "
                   f"chính sang branch khác rồi chạy lại `tal gc`.", file=sys.stderr)
             return False
@@ -2824,34 +2843,33 @@ def remove_worktree(issue: int) -> bool:
             if getattr(r, "returncode", 1) != 0:
                 err = (getattr(r, "stderr", None) or getattr(r, "stdout", None) or "").strip()
                 if err:
-                    print(f"  ⚠️ #{issue}: git worktree remove {path}: {err}")
+                    print(f"  ⚠️ {br}: git worktree remove {path}: {err}")
         if path.exists():
             orphan = path.with_name(f"{path.name}.orphan-{now().strftime('%Y%m%dT%H%M%SZ')}")
             try:
                 path.rename(orphan)
             except OSError as e:
-                print(f"  ⚠️ #{issue}: không dời được {path} ({e}) — GIỮ NGUYÊN đăng ký "
+                print(f"  ⚠️ {br}: không dời được {path} ({e}) — GIỮ NGUYÊN đăng ký "
                       f"git worktree, không prune, không xoá branch (#2177). Dọn tay rồi "
                       f"chạy lại `tal gc`.")
                 return False
             if not remove_orphan_tree(orphan):
-                print(f"  ⚠️ #{issue}: xoá không hết, phần còn lại nằm ở {orphan} — "
+                print(f"  ⚠️ {br}: xoá không hết, phần còn lại nằm ở {orphan} — "
                       f"git không còn trỏ vào đó; `tal gc` sẽ thử lại lượt sau.")
                 cleaned = False
     run(["git", "worktree", "prune"], cwd=root, check=False)
-    br = f"issue-{issue}"
     if branch_exists_local(br):
         r = run(["git", "branch", "-D", br], cwd=root, check=False)
         err = (getattr(r, "stderr", None) or getattr(r, "stdout", None) or "").strip()
         still = branch_exists_local(br)
         if getattr(r, "returncode", 1) != 0 or still:
-            print(f"  ⚠️ #{issue}: không xoá được branch {br}"
+            print(f"  ⚠️ {br}: không xoá được branch"
                   + (f": {err}" if err else "")
                   + " — KHÔNG khai đã xoá (#2710).")
             return False
-    leftover = worktree_paths_for_issue(issue)
+    leftover = worktree_paths_for_branch(br)
     if leftover:
-        print(f"  ⚠️ #{issue}: worktree vẫn còn: "
+        print(f"  ⚠️ {br}: worktree vẫn còn: "
               f"{', '.join(str(p) for p in leftover)} — KHÔNG khai đã xoá (#2710).")
         return False
     return cleaned
@@ -3493,21 +3511,55 @@ def pr_issue(pr: int) -> int:
                "chỉ định tường minh thay vì để tal đoán")
 
 
+def head_issue(pr: dict) -> int | None:
+    """Issue NEO của một PR, suy từ bản ghi `gh pr list` — KHÔNG cắt tên nhánh.
+
+    #4163 — hai chỗ từng làm `int(headRefName.split("-")[1])`. Với `issue-4127` nó
+    đúng; với `batch-20260907-0431` nó trả **20260907** và `tal` đi hỏi GitHub về một
+    issue không tồn tại, rồi chết giữa lúc liệt kê hàng đợi review.
+
+    Cùng họ với bug bốn-bản-lọc-head: một phép đo khoá vào HÌNH DẠNG của một loại
+    nhánh, rồi im lặng sai khi có loại thứ hai. Nhánh lô không mang số issue trong
+    tên — đó là điểm của nó — nên nguồn duy nhất đúng là các dòng `Closes #N` trong
+    thân PR, tức thứ chính `tal pr` đã ghi vào.
+
+    Thiếu `body` trong `gh pr list --json` thì hàm này đọc chuỗi rỗng và trả None —
+    lô lại vô hình, im lặng y hệt bug gốc. Nên bản ghi KHÔNG CÓ khoá `body` là lỗi
+    lập trình ở chỗ gọi, và nó phải nổ ở đó chứ không được thoái hoá thành "hết việc"
+    (#2300: không đo được KHÁC đo ra rỗng)."""
+    m = re.match(r"^issue-(\d+)$", pr.get("headRefName") or "")
+    if m:
+        return int(m.group(1))
+    if "body" not in pr:
+        raise Fail(
+            f"head_issue nhận bản ghi PR #{pr.get('number')} (head "
+            f"{pr.get('headRefName')!r}) không có trường `body` — thêm `body` vào danh "
+            "sách `gh pr list --json` ở chỗ gọi. Nhánh lô không mang số issue trong tên, "
+            "nên thiếu trường này là PR của cả một LÔ biến mất khỏi hàng đợi mà không ai đỏ.")
+    for line in (pr.get("body") or "").splitlines():
+        mm = re.match(r"^\s*(?:closes|fixes|resolves)\s+#(\d+)\s*$", line, re.I)
+        if mm:
+            return int(mm.group(1))
+    return None
+
+
 def cmd_review_queue(a):
     live = {r["key"]: r for r in refs_all_full()}
     # #2151 — hàng đợi REVIEW: cùng lý do như open_issues().
     prs = gh_json_required(
         ["pr", "list", "-R", C.repo, "--state", "open", "--limit", "100",
-         "--json", "number,title,headRefName,isDraft,labels,updatedAt,author,headRefOid"]
+         "--json", "number,title,headRefName,isDraft,labels,updatedAt,author,headRefOid,body"]
     )
     out = []
     claimed = []          # #2172 — "rỗng vì bị giữ" phải đọc KHÁC "rỗng vì hết việc"
     orphans = []          # #2673 — PR chưa bao giờ VÀO vòng lặp: cũng không phải hết việc
     humans = []           # #2760 — PR của NGƯỜI: agent không đụng, chỉ hiển thị
     for p in prs:
-        if p["isDraft"] or not re.match(r"^issue-\d+$", p["headRefName"]):
+        if p["isDraft"] or not TRACKED_HEAD.match(p["headRefName"]):
             continue
-        issue = int(p["headRefName"].split("-")[1])
+        issue = head_issue(p)
+        if issue is None:
+            continue
         names = set(issue_data(issue)["labels"])
         if L_AWAIT not in names and L_REVIEWING not in names:
             # #2673 — RỔ THỨ BA. Trước đây chỗ này `continue` im lặng, nên một PR
@@ -4600,7 +4652,7 @@ def cmd_merge_queue(a):
                             "--json", "number,title,headRefName,isDraft"])
     out = []
     for p in prs:
-        if p["isDraft"] or not re.match(r"^issue-\d+$", p["headRefName"]):
+        if p["isDraft"] or not TRACKED_HEAD.match(p["headRefName"]):
             continue
         issue, why, _ev = merge_blockers(p["number"], require_ci=not a.batch)
         out.append({"pr": p["number"], "issue": issue, "title": p["title"],
@@ -5736,7 +5788,7 @@ def cmd_merge_batch(a):
                    "--json", "number,title,headRefName,isDraft,headRefOid"], default=[])
     lot = []
     for p in prs:
-        if p["isDraft"] or not re.match(r"^issue-\d+$", p["headRefName"]):
+        if p["isDraft"] or not TRACKED_HEAD.match(p["headRefName"]):
             continue
         issue, why, _ev = merge_blockers(p["number"], require_ci=False)
         if why:
@@ -6470,10 +6522,16 @@ def cmd_gc(a):
     umbrella_open_heads = {p["headRefName"] for p in open_pr_rows}
 
     for p in merged_prs:
-        m = re.match(r"^issue-(\d+)$", p["headRefName"])
-        if not m:
+        # #4163 — bản lọc head thứ NĂM. Bốn bản kia lọt qua vì chúng chỉ `continue`;
+        # bản này còn dựng đường dẫn `issue-{n}` cho phần dọn cục bộ, nên nhánh lô
+        # vừa bị bỏ qua ở (1) — issue của lô ở lại OPEN + `agent:reviewing` sau khi
+        # PR lô đã merge — vừa để lại nguyên cây `batch-<id>` ở (2).
+        head = p["headRefName"]
+        if not TRACKED_HEAD.match(head):
             continue
-        issue = int(m.group(1))
+        issue = head_issue(p)
+        if issue is None:
+            continue
 
         # (1) đối chiếu nhãn — chạy dù máy này chưa từng có worktree cho issue đó.
         #
@@ -6515,15 +6573,15 @@ def cmd_gc(a):
                            check=False)
 
         # (2) dọn cục bộ — hỏi git worktree list, không đoán thư mục (#2710).
-        paths = worktree_paths_for_issue(issue)
-        if not paths and not branch_exists_local(f"issue-{issue}"):
+        paths = worktree_paths_for_branch(head)
+        if not paths and not branch_exists_local(head):
             continue
-        wt = paths[0] if paths else (C.worktrees_dir / f"issue-{issue}")
+        wt = paths[0] if paths else (C.worktrees_dir / head)
         if issue in live:
             acts.append({"issue": issue, "action": "BỎ QUA worktree — có lease đang sống "
                                                    "(issue được claim lại sau PR đã merge)"})
             continue
-        if f"issue-{issue}" in umbrella_open_heads:
+        if head in umbrella_open_heads:
             # Vòng sửa đã mở PR mới từ cùng branch và đã nhả lease (đúng thiết kế
             # của `tal pr`). Xoá branch cục bộ ở đây là vứt bản sao cuối cùng của
             # công việc đó trên máy này — remote đã được chừa ở
@@ -6551,7 +6609,7 @@ def cmd_gc(a):
         # Xác thì đi đường orphan sẵn có của #2177 (`remove_worktree` dời sang
         # `<tên>.orphan-<ts>` rồi mới rmtree), không phải đường "cây bẩn".
         if wt.exists() and not worktree_attached(wt):
-            if dry or remove_worktree(issue):
+            if dry or remove_worktree(head):
                 acts.append({"issue": issue,
                              "action": "xoá XÁC worktree — thư mục còn nhưng đăng ký git "
                                        "đã mất (#2201) + branch cục bộ"})
@@ -6572,13 +6630,13 @@ def cmd_gc(a):
             # #2792 — hỏi GitHub một lần cho branch này; None nghĩa là
             # "không có PR merged để đối chiếu", tức đi tiếp đường so nội dung.
             keep = worktree_unmerged_content(
-                wt, BASE_BRANCH, merged_head_sha=merged_pr_head_sha(f"issue-{issue}"))
+                wt, BASE_BRANCH, merged_head_sha=merged_pr_head_sha(head))
             if keep:
                 acts.append({"issue": issue,
                              "action": f"BỎ QUA worktree — {keep} "
                                        f"(push hoặc bỏ tay rồi gc lại)"})
                 continue
-        if dry or remove_worktree(issue):
+        if dry or remove_worktree(head):
             acts.append({"issue": issue, "action": "xoá worktree + branch cục bộ (PR đã merge)"})
         else:
             acts.append({"issue": issue,
@@ -6604,10 +6662,12 @@ def cmd_gc(a):
     # PR đóng mà KHÔNG merge = việc bị bỏ. Xoá branch là mất code, nên chỉ báo,
     # trừ khi người yêu cầu rõ bằng --include-abandoned.
     for p in gh_json(["pr", "list", "-R", C.repo, "--state", "closed", "--limit", "100",
-                      "--json", "number,headRefName,mergedAt"], default=[]):
-        if p.get("mergedAt") or not re.match(r"^issue-\d+$", p["headRefName"]):
+                      "--json", "number,headRefName,mergedAt,body"], default=[]):
+        if p.get("mergedAt") or not TRACKED_HEAD.match(p["headRefName"]):
             continue
-        issue = int(p["headRefName"].split("-")[1])
+        issue = head_issue(p)
+        if issue is None:
+            continue
         # Chỉ báo khi THẬT SỰ còn gì để dọn. Không kiểm thì mọi PR bị đóng sẽ được nhắc
         # lại ở từng lượt gc, vĩnh viễn — và tiếng ồn lặp lại thì người đọc bắt đầu bỏ qua
         # cả những dòng có thật.
