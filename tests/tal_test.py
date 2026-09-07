@@ -6978,5 +6978,57 @@ def test_4160_doctor_does_not_enable_the_setting_that_deletes_the_base_branch():
     check("#4160" in doc, "doctor dẫn số issue để người đọc tra được vì sao")
 
 
+def test_push_rail_asks_the_destination_not_the_spelling():
+    """#4160 vòng 2 — rào push khớp CHUỖI CON, nên nó chặn oan mọi nhánh có
+    `dev`/`main` làm một từ trong tên.
+
+    Đo được ngay lúc sửa #4160: `git push -u origin doctor-stops-deleting-dev` bị từ
+    chối — nhánh của chính bản vá ấy. `\bdev\b` khớp phần đuôi vì `-` là ranh giới từ.
+
+    File này đã tự nói ra hậu quả ở `strip_heredocs`: "rào báo OAN thì bị TẮT, không
+    bị tranh luận". Một rào an toàn báo oan đúng vào lúc người ta đang sửa chính nó
+    là rào sẽ bị gỡ — nên đây không phải phiền toái nhỏ, nó là lỗi của rào.
+
+    Câu hỏi đúng không phải "dòng lệnh có chứa chữ dev không" mà "refspec đẩy vào
+    nhánh nào".
+    """
+    print("rào push hỏi ĐÍCH của refspec, không hỏi cách VIẾT dòng lệnh")
+
+    base, promo = tal.BASE_BRANCH, tal.PROMOTION_BRANCH
+    tal.BASE_BRANCH, tal.PROMOTION_BRANCH = "dev", "main"
+    try:
+        cho = [
+            "git push -u origin doctor-stops-deleting-dev",   # ca đã đo được
+            "git push origin fix/main-menu-overflow",
+            "git push origin issue-4160-restore-dev",
+            "git push -o ci.skip origin my-dev-branch",       # cờ nuốt tham số
+            "git add -A && git commit -m x && git push origin batch-20260907-0431",
+            "git push --force-with-lease=dev:abc origin issue-9",
+        ]
+        chan = [
+            "git push origin dev",
+            "git push origin main",
+            "git push origin HEAD:main",
+            "git push -f origin issue-1:dev",                 # đích nằm SAU dấu hai chấm
+            "git push origin refs/heads/dev",
+        ]
+        for c in cho:
+            check(not tal.pushes_to_protected(c), f"CHO: {c}")
+        for c in chan:
+            check(tal.pushes_to_protected(c), f"CHẶN: {c}")
+
+        # Không phân tích được ⇒ LÙI về regex cũ, không nhả. Rào an toàn mà "không đo
+        # được" thành "cho qua" là đúng lớp lỗi #2300 đã chữa ở khắp nơi khác.
+        saved = tal.push_targets
+        tal.push_targets = lambda cmd: None
+        try:
+            check(tal.pushes_to_protected("git push origin dev"),
+                  "không phân tích được ⇒ vẫn chặn (fail-closed)")
+        finally:
+            tal.push_targets = saved
+    finally:
+        tal.BASE_BRANCH, tal.PROMOTION_BRANCH = base, promo
+
+
 if __name__ == "__main__":
     sys.exit(main())

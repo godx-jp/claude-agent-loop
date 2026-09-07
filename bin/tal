@@ -7358,9 +7358,88 @@ PUSH_RE = re.compile(r"\bgit\s+push\b|\bgh\s+pr\s+create\b")
 def danger_re() -> re.Pattern:
     """Push thẳng vào base/promotion. Dựng theo CONFIG, không ghi cứng `dev|main`:
     tên nhánh ghi cứng ở đây là một rào IM LẶNG KHÔNG ĐÓNG ở mọi repo đặt tên khác,
-    và rào im lặng không đóng thì tệ hơn không có rào."""
+    và rào im lặng không đóng thì tệ hơn không có rào.
+
+    CHỈ còn là đường LÙI của `push_targets` (xem ở dưới) — nó khớp chuỗi con nên
+    báo oan với mọi nhánh có `dev`/`main` làm một từ trong tên."""
     names = "|".join(re.escape(x) for x in {BASE_BRANCH, PROMOTION_BRANCH} if x)
     return re.compile(rf"\bgit\s+push\b.*\b(origin\s+)?({names})\b")
+
+
+# Cờ của `git push` có NUỐT một tham số đứng sau. Không biết danh sách này thì
+# `git push -o ci.skip origin nhánh` bị đọc thành "remote = ci.skip".
+_PUSH_FLAGS_WITH_VALUE = {"-o", "--push-option", "--receive-pack", "--exec", "--repo"}
+
+
+def push_targets(cmdline: str) -> list[str] | None:
+    """Nhánh ĐÍCH của mọi `git push` trong `cmdline`; `None` = không phân tích được.
+
+    #4160 vòng 2 — rào cũ khớp CHUỖI CON trên cả dòng lệnh, nên nó chặn oan mọi
+    nhánh mang `dev`/`main` như một từ trong tên. Đo được: `git push -u origin
+    doctor-stops-deleting-dev` bị từ chối — nhánh của chính bản vá cho #4160.
+    `fix/main-menu-overflow`, `issue-4160-restore-dev` cũng vậy.
+
+    Đó không phải phiền toái nhỏ, và file này đã tự nói ra ở `strip_heredocs`:
+    "rào báo OAN thì bị TẮT, không bị tranh luận". Một rào an toàn báo oan đúng
+    vào lúc người ta đang sửa chính nó là rào sẽ bị gỡ.
+
+    Nên hỏi đúng câu hỏi: đích của refspec là gì. `a:b` đẩy vào `b`; `a` trần đẩy
+    vào `a`; không refspec nào thì đích là nhánh đang đứng, trả `HEAD` cho chỗ gọi
+    tự giải. Không phân tích được thì trả None và chỗ gọi lùi về regex cũ —
+    fail-closed: thà chặn oan còn hơn để lọt một lệnh push thật.
+    """
+    import shlex
+    targets: list[str] = []
+    for part in re.split(r"&&|\|\||;|\||\n", cmdline):
+        if not re.search(r"\bgit\b.*\bpush\b", part):
+            continue
+        try:
+            toks = shlex.split(part)
+        except ValueError:
+            return None
+        if "push" not in toks:
+            return None
+        rest = toks[toks.index("push") + 1:]
+        args, i, delete = [], 0, False
+        while i < len(rest):
+            t = rest[i]
+            if t == "--delete" or t == "-d":
+                delete = True
+            elif t in _PUSH_FLAGS_WITH_VALUE:
+                i += 1
+            elif t.startswith("-"):
+                pass
+            else:
+                args.append(t)
+            i += 1
+        if not args:
+            targets.append("HEAD")          # `git push` trần: đích = nhánh đang đứng
+            continue
+        specs = args[1:]                    # args[0] là remote
+        if not specs:
+            targets.append("HEAD")
+            continue
+        for sp in specs:
+            dst = sp.split(":", 1)[1] if ":" in sp else sp
+            dst = dst.lstrip("+").removeprefix("refs/heads/")
+            targets.append(dst or ("" if delete else "HEAD"))
+    return targets
+
+
+def pushes_to_protected(cmdline: str) -> bool:
+    """`cmdline` có đẩy thẳng vào base/promotion không."""
+    tg = push_targets(cmdline)
+    if tg is None:
+        return bool(danger_re().search(cmdline))     # không đo được ⇒ chặn như cũ
+    protected = {x for x in (BASE_BRANCH, PROMOTION_BRANCH) if x}
+    for t in tg:
+        if t == "HEAD":
+            cur = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False).stdout.strip()
+            if cur in protected:
+                return True
+        elif t in protected:
+            return True
+    return False
 
 
 DANGER_RE = danger_re()
@@ -7645,7 +7724,7 @@ def cmd_hook_guard(a):
                         f"`{PROMOTION_BRANCH}`."
                     )
 
-        if danger_re().search(cmdline):
+        if pushes_to_protected(cmdline):
             where = f" từ worktree issue #{context[1]['issue']}" if context else ""
             deny(f"[tal] Không push thẳng vào {BASE_BRANCH}/{PROMOTION_BRANCH}{where}. "
                  f"Dùng `tal pr` để mở PR vào {BASE_BRANCH}.")
