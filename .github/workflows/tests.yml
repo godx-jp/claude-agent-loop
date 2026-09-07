@@ -1,0 +1,25 @@
+# Kho này bán một thứ: những cái CỔNG không im lặng. Mà chính nó thì chạy 150 ca
+# test chỉ khi có người nhớ gõ tay — nên một bản sửa làm đỏ bộ test vẫn vào được
+# `main`, rồi mọi consumer ghim theo commit đó nhận cái đỏ ấy.
+#
+# Cổng này cố ý NHỎ: một job, không cache, không `setup-*`. Bộ test là Python
+# thuần stdlib (không import gì ngoài chuẩn), nên `python3` của runner là đủ —
+# thêm bước cài đặt chỉ là thêm chỗ để hỏng.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tests/tal_test.py
+      # `bin/tal` là file chạy được, không phải module — cú pháp hỏng thì mọi
+      # lệnh chết ngay dòng đầu, và bộ test ở trên đã import nó nên chỗ này chỉ
+      # là chốt chặn rẻ tiền cho trường hợp bộ test bị bỏ qua.
+      - run: python3 -c "import ast,pathlib; ast.parse(pathlib.Path('bin/tal').read_text())"
