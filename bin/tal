@@ -2671,7 +2671,58 @@ def ensure_worktree_branch(branch: str) -> Path:
     else:
         run(["git", "worktree", "add", "-b", branch, str(path), f"origin/{BASE_BRANCH}"], cwd=str(root))
     exclude_lease(path)
+    ensure_worktree_setup(path)
     return path
+
+
+def worktree_setup_marker(wt: Path) -> Path | None:
+    """Dấu "đã dựng" của MỘT worktree, đặt trong git-dir RIÊNG của nó.
+
+    Với worktree phụ, `--git-dir` là `<common>/worktrees/<tên>` — nó ra đời và
+    biến mất cùng worktree, nên không có sổ nào phải dọn và không file nào lọt
+    vào `git status`."""
+    gd = run(["git", "rev-parse", "--path-format=absolute", "--git-dir"],
+             cwd=str(wt), check=False).stdout.strip()
+    return Path(gd) / "tal-setup-done" if gd else None
+
+
+def ensure_worktree_setup(wt: Path) -> None:
+    """Dựng môi trường MỘT LẦN cho mỗi worktree của vòng lặp.
+
+    `git worktree add` chỉ mang theo file ĐÃ TRACK. `vendor/`, `node_modules/`,
+    `.env` thì không — nên worktree vừa tạo là cây TRẦN.
+
+    Trước #6, `setup` chỉ được đọc ở `merge-batch` (cây tạm cho `fullSuite`), còn
+    đường vòng lặp — `claim` / `batch claim` → `tests --run` — không đọc nó một lần
+    nào. Hậu quả đo được ở godx-tempo: phần dựng môi trường bị DÁN TAY vào từng
+    luật `affectedTests` — 10 luật lặp hai dòng composer/.env, 8 luật lặp
+    `pnpm install` — đúng những dòng đã khai ở `setup` của chính kho ấy. Ba cái
+    giá: cấu hình consumer mang việc dựng cổng; sửa `setup` không có tác dụng gì
+    với vòng lặp; và quên dán vào một luật mới thì lượt chạy đầu trượt vì thiếu
+    dependency, đọc như "test của mày đỏ".
+
+    Nên mã thoát ở đây là `GATE_BROKEN`, giống hệt cây tạm của `merge-batch`:
+    chưa test nào được chạy thì đó không phải test đỏ."""
+    cmds = setup_cmds()
+    if not cmds:
+        return
+    marker = worktree_setup_marker(wt)
+    if marker is not None and marker.exists():
+        return
+    print(f"dựng môi trường trong worktree ({len(cmds)} bước) — `git worktree add` "
+          f"không mang theo vendor/ node_modules/ .env")
+    run_stage(wt, cmds,
+              "CỔNG HỎNG — không dựng được môi trường trong worktree. ĐÂY KHÔNG PHẢI "
+              "TEST ĐỎ: chưa test nào được chạy. Sửa `setup` trong "
+              ".claude/agent-loop.json:", GATE_BROKEN)
+    verify = setup_verify_cmds()
+    if verify:
+        run_stage(wt, verify,
+                  "CỔNG HỎNG — môi trường dựng xong mà `setupVerify` vẫn trượt. Thường là "
+                  "`affectedTests`/`fullSuite` được thêm lệnh mới mà `setup` chưa theo:",
+                  GATE_BROKEN)
+    if marker is not None:
+        marker.write_text(iso(now()) + "\n")
 
 
 def exclude_lease(path: Path):

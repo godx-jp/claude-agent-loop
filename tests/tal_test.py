@@ -6875,5 +6875,66 @@ def test_batch_prs_are_visible_to_every_downstream_command():
           "PR lô không có dòng Closes thì trả None, không đoán bừa")
 
 
+def test_setup_runs_once_per_worktree_and_fails_as_a_broken_gate():
+    """#6 — `setup` phải chạy ở ĐƯỜNG VÒNG LẶP, không chỉ ở cây tạm của merge-batch.
+
+    Trước bản sửa, `setup`/`setupVerify` chỉ được đọc ở một chỗ duy nhất trong
+    `bin/tal`: `cmd_merge_batch`. Worktree do `claim`/`batch claim` tạo là cây TRẦN
+    (`git worktree add` chỉ mang file đã track), nên mỗi consumer phải dán tay phần
+    dựng môi trường vào TỪNG luật `affectedTests` — đo ở godx-tempo: 10 luật lặp
+    composer/.env, 8 luật lặp `pnpm install`, đúng những dòng đã khai ở `setup`.
+    """
+    print("#6 `setup` chạy một lần cho mỗi worktree, và trượt thì là CỔNG HỎNG")
+
+    src = TAL.read_text(encoding="utf-8")
+    blk = src[src.index("def ensure_worktree_branch("):]
+    blk = blk[:blk.index("\ndef ", 10)]
+    check("ensure_worktree_setup(" in blk,
+          "`ensure_worktree_branch` gọi dựng môi trường cho cây vừa tạo",
+          "không gọi thì `setup` vẫn chỉ sống ở merge-batch")
+
+    with tempfile.TemporaryDirectory() as td:
+        wt = Path(td) / "wt"; wt.mkdir()
+        marker = Path(td) / "tal-setup-done"
+        tal.worktree_setup_marker = lambda p: marker
+
+        # (a) kho không khai `setup` ⇒ im lặng đi qua, không dựng cái dấu nào.
+        tal.setup_cmds = lambda: []
+        tal.setup_verify_cmds = lambda: []
+        tal.ensure_worktree_setup(wt)
+        check(not marker.exists(), "không khai `setup` ⇒ không làm gì, không ghi dấu")
+
+        # (b) chạy `setup` rồi `setupVerify`, ĐÚNG THỨ TỰ, rồi mới ghi dấu.
+        ran: list[str] = []
+        tal.setup_cmds = lambda: ["dựng-1", "dựng-2"]
+        tal.setup_verify_cmds = lambda: ["kiểm"]
+        tal.run_stage = lambda tmp, cmds, msg, code: ran.extend(cmds)
+        tal.ensure_worktree_setup(wt)
+        check(ran == ["dựng-1", "dựng-2", "kiểm"],
+              "setup chạy trước, setupVerify sau", str(ran))
+        check(marker.exists(), "dựng xong mới ghi dấu")
+
+        # (c) lần hai không trả tiền lại — đó là điểm của cái dấu.
+        ran.clear()
+        tal.ensure_worktree_setup(wt)
+        check(ran == [], "worktree đã dựng ⇒ lượt sau bỏ qua", str(ran))
+
+        # (d) `setup` trượt ⇒ CỔNG HỎNG (3), KHÔNG phải test đỏ (2), và KHÔNG ghi dấu:
+        # ghi dấu ở đây là để lại một cây trần mà mọi lượt sau tin là đã dựng.
+        marker.unlink()
+        tal.run_stage = REAL["run_stage"]
+        tal.setup_cmds = lambda: ["exit 7"]
+        try:
+            tal.ensure_worktree_setup(wt)
+            check(False, "`setup` trượt ⇒ phải NÉM", "đi qua im lặng")
+        except tal.Fail as e:
+            check(getattr(e, "code", None) == tal.GATE_BROKEN,
+                  f"mã thoát = {tal.GATE_BROKEN} (cổng hỏng), không phải 2 (test đỏ)",
+                  f"code={getattr(e, 'code', None)}")
+            check("KHÔNG PHẢI TEST ĐỎ" in str(e),
+                  "thông báo nói thẳng đây không phải test đỏ", str(e)[:120])
+        check(not marker.exists(), "dựng trượt ⇒ KHÔNG ghi dấu")
+
+
 if __name__ == "__main__":
     sys.exit(main())
